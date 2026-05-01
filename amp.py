@@ -8,6 +8,39 @@ def generate_sk_matrix(N):
     np.fill_diagonal(J, 0.0)
     return J
 
+# non-random matrix
+def generate_structured_matrix(N):
+    # create a single 'perfect' hidden solution
+    hidden_pattern = np.random.choice([-1.0, 1.0], size=N)
+    
+    # the matrix is the outer product of this pattern.
+    # it creates a landscape with a single, massive, unfrustrated valley.
+    J = np.outer(hidden_pattern, hidden_pattern) / N
+    np.fill_diagonal(J, 0.0)
+    
+    # the absolute lowest possible energy for this specific matrix is exactly -0.5 * N
+    theoretical_floor = -0.5 * N 
+    
+    return J, theoretical_floor
+
+#  a multi-pattern structured landscape (Hopfield Network). this violates the Wigner eigenvalue spectrum assumed by SK-AMP
+def generate_hopfield_matrix(N, num_patterns=50):
+
+    J = np.zeros((N, N))
+    
+    # plant multiple overlapping hidden patterns
+    for _ in range(num_patterns):
+        pattern = np.random.choice([-1.0, 1.0], size=N)
+        J += np.outer(pattern, pattern)
+        
+    J /= N
+    np.fill_diagonal(J, 0.0)
+    
+    # the theoretical floor is harder to define precisely for K patterns, but we can use an approximation for the benchmark gap
+    approx_floor = -0.5 * N * (1 + np.sqrt(num_patterns/N))
+    
+    return J, approx_floor
+
 def calculate_energy(sigma, J):
     # the Hamiltonian: -0.5 * sigma^T * J * sigma
     return -0.5 * (sigma.T @ J @ sigma)
@@ -88,43 +121,47 @@ def get_orthogonal_starts(num_starts, N, scale=0.001):
     # return the columns of Q (transposed to rows) scaled to the starting belief size
     return Q.T[:num_starts] * scale
 
-N = 1000
-num_restarts = 100 # explore n different random start points
+N = 10000
+num_restarts = 100
 best_energy = np.inf
 best_spins = None
 
-print(f"Generating SK Model (N={N})...")
-J_matrix = generate_sk_matrix(N)
-parisi_val = -0.7633 * N # the theoretical floor
+# choose "STRUCTURED" || "RANDOM" || "HOPFIELD"
+TEST_MODE = "HOPFIELD"
+
+print(f"--- Running in {TEST_MODE} mode (N={N}) ---")
+
+if TEST_MODE == "RANDOM":
+    J_matrix = generate_sk_matrix(N)
+    theoretical_limit = -0.7633 * N
+elif TEST_MODE == "STRUCTURED":
+    J_matrix, theoretical_limit = generate_structured_matrix(N)
+elif TEST_MODE == "HOPFIELD":
+    J_matrix, theoretical_limit = generate_hopfield_matrix(N, num_patterns=10)
 
 # run GD
 gd_final_spins, gd_energy_history = gradient_descent_sk(J_matrix)
 
-# generate the set of orthogonal starting points before the loop begins
+# run AMP sweep
 print(f"Generating {num_restarts} Orthogonal Starting Points...")
 orthogonal_starts = get_orthogonal_starts(num_restarts, N)
 
 print(f"Starting Multi-Start Sweep ({num_restarts} runs)...")
-
 for i in range(num_restarts):
-    # run message passing
     raw_spins = amp_sk(J_matrix, m_init=orthogonal_starts[i])
-    
-    # perform the greedy "Polish"
     quenched_spins = greedy_quench(raw_spins, J_matrix)
-    
     current_energy = calculate_energy(quenched_spins, J_matrix)
     
     if current_energy < best_energy:
         best_energy = current_energy
         best_spins = quenched_spins
     
-    print(f"  Run {i+1:03d}: Energy {current_energy:8.2f} | Gap to Limit: {abs(current_energy - parisi_val):8.2f}")
+    # only print every 10th run
+    if (i + 1) % 10 == 0 or i == 0:
+        print(f"  Run {i+1:03d}: Energy {current_energy:8.2f} | Gap to Limit: {abs(current_energy - theoretical_limit):8.2f}")
 
 print("\n" + "="*45)
-print(f"FINAL BEST ENERGY: {best_energy:.4f}")
-print(f"THEORETICAL LIMIT: {parisi_val:.4f}")
-print(f"EFFICIENCY:        {100 * (best_energy/parisi_val):.2f}% of optimal")
+print(f"FINAL BEST AMP ENERGY: {best_energy:.4f}")
+print(f"GRADIENT DESCENT FINAL: {gd_energy_history[-1]:.4f}")
+print(f"THEORETICAL LIMIT:      {theoretical_limit:.4f}")
 print("="*45)
-
-print(f"Gradient Descent Final Energy: {gd_energy_history[-1]:.4f}")
