@@ -107,7 +107,7 @@ orthogonal_starts = get_orthogonal_starts(num_restarts, N)
 print(f"Starting Multi-Start Sweep ({num_restarts} runs)...")
 
 for i in range(num_restarts):
-    # run message passing (MODIFIED: passing in one of the orthogonal starts)
+    # run message passing
     raw_spins = amp_sk(J_matrix, m_init=orthogonal_starts[i])
     
     # perform the greedy "Polish"
