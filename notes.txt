@@ -1,0 +1,4 @@
+Why this matters for your paper. This is the precise quantitative form of the standard intuition that "AMP and gradient descent have the same asymptotic complexity." Both are O(N²) per iteration, but AMP gets there with a constant factor of ~2 (two matvecs equivalent) for less than 1% overhead, while delivering 4× better solution quality. When PHA enters the picture with O(N³) eigendecomposition cost, this argument flips: PHA's "extras" are not asymptotically negligible, they dominate. That's the contrast your benchmark will eventually highlight.
+
+
+
