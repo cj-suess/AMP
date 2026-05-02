@@ -1,0 +1,11 @@
+Document: (~May 16)
+    --> Link code
+    --> Benchmarking(expalin; make plots + interpret them)
+    --> 5-10 pages
+        - Introduction(1 page: what we did; how we did it)
+        - literature overview
+        - Body(be coherent)
+        - Conclusion(suggest future work)
+
+Presentation:
+    --> 12 mins
