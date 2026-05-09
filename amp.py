@@ -38,12 +38,19 @@ print('Libraries loaded.')
 # =============================================================================
 
 def generate_sk_matrix(N, rng):
-    J = rng.normal(0.0, 1.0 / np.sqrt(N), size=(N, N))
-    J = (J + J.T) / np.sqrt(2)
+    # GOE convention aligned with the SK Hamiltonian below:
+    # sample upper triangle once, mirror, and force J_ii = 0.
+    J = np.zeros((N, N), dtype=float)
+    iu = np.triu_indices(N, k=1)
+    vals = rng.normal(0.0, 1.0 / np.sqrt(N), size=iu[0].shape[0])
+    J[iu] = vals
+    J[(iu[1], iu[0])] = vals
     np.fill_diagonal(J, 0.0)
     return J
 
 def calculate_energy(sigma, J):
+    # Montanari-style SK sign convention:
+    # H_N(sigma) = -0.5 * sigma^T J sigma, with sigma_i in {-1,+1}.
     return -0.5 * (sigma @ J @ sigma)
 
 def energy_per_spin(sigma, J):
@@ -99,19 +106,134 @@ def stochastic_gradient_descent_sk(J, num_iterations, learning_rate,
 
 # ── AMP ──────────────────────────────────────────────────────────────────────
 
-def amp_sk(J, m_init, num_iterations, damping):
+def amp_sk(J, m_init, num_iterations, damping, beta_max=2.0):
+    """Cam's AMP: damped schedule with Onsager term using beta_{t-1}."""
     N = J.shape[0]
     m = np.copy(m_init)
     m_old = np.zeros(N)
     h = np.zeros(N)
-    betas = np.linspace(0.1, 2.5, num_iterations)
+    betas = np.linspace(0.1, beta_max, num_iterations)
+    beta_prev = betas[0]
+    onsager_prev = np.mean(1.0 - m**2)
     for beta in betas:
         onsager = np.mean(1.0 - m**2)
-        h_target = J @ m - beta * onsager * m_old
+        h_target = J @ m - beta_prev * onsager_prev * m_old
         h = damping * h + (1.0 - damping) * h_target
         m_old = np.copy(m)
         m = np.tanh(beta * h)
+        beta_prev = beta
+        onsager_prev = onsager
     return np.sign(m)
+
+
+def amp_traditional_sk(J, m_init, num_iterations, beta_max=2.0):
+    """Traditional AMP without damping; uses beta_{t-1} Onsager coefficient."""
+    N = J.shape[0]
+    m = np.copy(m_init)
+    m_old = np.zeros(N)
+    betas = np.linspace(0.1, beta_max, num_iterations)
+    beta_prev = betas[0]
+    onsager_prev = np.mean(1.0 - m**2)
+    for beta in betas:
+        h = J @ m - beta_prev * onsager_prev * m_old
+        m_new = np.tanh(beta * h)
+        onsager_prev = np.mean(1.0 - m_new**2)
+        beta_prev = beta
+        m_old, m = m, m_new
+    return np.sign(m)
+
+
+def solve_parisi_pde_sk(mu_t, x_grid, t_grid, cfl_safety=0.4):
+    """Backward solve of the Parisi PDE for SK (xi''(t)=1) via Cole-Hopf.
+
+    The PDE u_t = -0.5 * (u_xx + mu(t) u_x^2) is solved backward from
+    u(T, x) = log(2 cosh(x)) down to t=0. For piecewise-constant mu, the
+    Cole-Hopf substitution v = exp(mu u) linearizes it to a backward heat
+    equation v_t = -0.5 v_xx, which is unconditionally stable in forward
+    backward-time tau = T - t under any explicit scheme satisfying CFL.
+
+    We treat mu as piecewise-constant on each [t_grid[k], t_grid[k+1]] using
+    its right endpoint value, and re-transform u <-> v at each grid step.
+    """
+    nx = len(x_grid)
+    nt = len(t_grid)
+    dx = x_grid[1] - x_grid[0]
+    dt_max = cfl_safety * dx * dx
+    eps = 1e-12
+
+    Phi = np.zeros((nt, nx), dtype=float)
+    Phi[-1] = np.log(2.0 * np.cosh(x_grid))
+
+    u = Phi[-1].copy()
+    for k in range(nt - 2, -1, -1):
+        dt_total = t_grid[k + 1] - t_grid[k]
+        # Use the right-endpoint mu on this interval.
+        mu_seg = max(mu_t[k + 1], eps)
+        # Cole-Hopf transform: v = exp(mu u). Heat eqn forward in tau = T - t.
+        v = np.exp(mu_seg * u)
+        n_sub = max(1, int(np.ceil(dt_total / dt_max)))
+        dt_sub = dt_total / n_sub
+        for _ in range(n_sub):
+            vxx = np.gradient(np.gradient(v, dx, edge_order=2), dx, edge_order=2)
+            v = v + dt_sub * 0.5 * vxx
+            v[0] = v[1]
+            v[-1] = v[-2]
+            # Numerical floor to keep log finite if v drifts non-positive.
+            v = np.maximum(v, eps)
+        u = np.log(v) / mu_seg
+        Phi[k] = u
+
+    dPhi_dx = np.gradient(Phi, dx, axis=1, edge_order=2)
+    return Phi, dPhi_dx
+
+
+def iamp_sk(J, m_init, num_iterations, damping, pde_xmax=6.0, pde_nx=401,
+            x_grid=None, dPhi_dx=None):
+    """IAMP with Parisi-PDE-driven nonlinearity (Montanari-style control policy).
+
+    If x_grid and dPhi_dx are provided, skips the PDE solve and uses the cached
+    arrays. Otherwise solves the PDE inline. The cached path lets a restart
+    sweep reuse one PDE solve across many runs at the same num_iterations.
+
+    Note: uses a linear ansatz mu_t = linspace(0, 1, num_iterations), not the
+    true SK Parisi-optimal measure. This is a reasonable benchmark proxy but
+    not the rigorously optimal IAMP.
+    """
+    N = J.shape[0]
+    m = np.copy(m_init)
+    m_old = np.zeros(N)
+    h = np.zeros(N)
+
+    if x_grid is None or dPhi_dx is None:
+        t_grid = np.linspace(0.0, 1.0, num_iterations)
+        x_grid = np.linspace(-pde_xmax, pde_xmax, pde_nx)
+        mu_t = np.clip(np.linspace(0.0, 1.0, num_iterations), 0.0, 1.0)
+        _, dPhi_dx = solve_parisi_pde_sk(mu_t, x_grid, t_grid)
+
+    def policy(k, field):
+        grad = np.interp(field, x_grid, dPhi_dx[k], left=dPhi_dx[k, 0], right=dPhi_dx[k, -1])
+        return np.tanh(grad)
+
+    beta_prev = 0.1
+    onsager_prev = np.mean(1.0 - m**2)
+    for k in range(num_iterations):
+        h_target = J @ m - beta_prev * onsager_prev * m_old
+        h = damping * h + (1.0 - damping) * h_target
+        m_new = policy(k, h)
+        onsager_prev = np.mean(1.0 - m_new**2)
+        beta_prev = k / max(num_iterations - 1, 1)
+        m_old, m = m, m_new
+
+    return np.sign(m)
+
+
+def precompute_iamp_pde(num_iterations, pde_xmax=6.0, pde_nx=401):
+    """Solve the Parisi PDE once; reusable across restarts at the same iters."""
+    t_grid = np.linspace(0.0, 1.0, num_iterations)
+    x_grid = np.linspace(-pde_xmax, pde_xmax, pde_nx)
+    mu_t = np.clip(np.linspace(0.0, 1.0, num_iterations), 0.0, 1.0)
+    _, dPhi_dx = solve_parisi_pde_sk(mu_t, x_grid, t_grid)
+    return x_grid, dPhi_dx
 
 def greedy_quench(sigma, J):
     sigma_opt = np.copy(sigma).astype(float)
@@ -128,10 +250,27 @@ def greedy_quench(sigma, J):
         passes += 1
     return sigma_opt, passes
 
-def get_orthogonal_start(N, rng, scale=0.001):
-    v = rng.normal(size=N)
-    v /= np.linalg.norm(v)
-    return v * scale
+
+def project_to_spins_and_quench(sigma, J):
+    spins = np.sign(np.copy(sigma).astype(float))
+    spins[spins == 0] = 1.0
+    return greedy_quench(spins, J)
+
+def get_orthogonal_starts(num_starts, N, rng, scale=0.001):
+    """Generate `num_starts` near-center starts that are orthogonal in blocks.
+
+    Each vector has norm ~= scale/sqrt(N), so all coordinates stay close to 0
+    (the center of the hypercube [-1, 1]^N).
+    """
+    starts = np.zeros((num_starts, N), dtype=float)
+    filled = 0
+    while filled < num_starts:
+        block = min(N, num_starts - filled)
+        A = rng.normal(size=(N, block))
+        Q, _ = np.linalg.qr(A)
+        starts[filled:filled + block] = (Q.T * (scale / np.sqrt(N)))
+        filled += block
+    return starts
 
 # ── Spectral ─────────────────────────────────────────────────────────────────
 
@@ -172,6 +311,19 @@ def flops_sgd(N, iters, batch_size, num_energy_evals):
 def flops_amp_single(N, amp_iters, quench_passes):
     return amp_iters * (2 * N * N) + quench_passes * (2 * N * N)
 
+def flops_iamp_single(N, iamp_iters, quench_passes, pde_nx, pde_nt,
+                      include_pde=True):
+    """IAMP FLOPs: matvec + per-iter interp + PDE solve (if not cached).
+
+    The PDE solve is amortized when the same (iters, pde_nx, pde_nt) is reused
+    across restarts. Pass include_pde=False after the first restart in a cell.
+    """
+    matvec_cost = iamp_iters * (2 * N * N)
+    quench_cost = quench_passes * (2 * N * N)
+    interp_cost = iamp_iters * N * max(1, int(np.log2(max(pde_nx, 2))))
+    pde_cost = pde_nt * pde_nx * 5 if include_pde else 0
+    return matvec_cost + quench_cost + interp_cost + pde_cost
+
 def flops_spectral(N, lanczos_iters, quench_passes):
     return (lanczos_iters + quench_passes + 1) * (2 * N * N)
 
@@ -183,9 +335,9 @@ print('FLOP estimators defined.')
 # =============================================================================
 
 # Experiments 1 & 2
-N_VALUES         = [50, 100, 250, 500, 1000, 2000, 3000, 5000]
-ITERATION_VALUES = [100, 250, 500, 1000]
-NUM_SEEDS        = 10
+N_VALUES         = [50, 100, 250, 500] # , 1000, 2000, 3000, 5000
+ITERATION_VALUES = [100, 250] # , 500, 1000
+NUM_SEEDS        = 3
 TIME_BUDGET_SEC  = 2.0
 
 # Experiment 3
@@ -202,9 +354,19 @@ SGD_LR          = 0.05
 SGD_BATCH_SIZE  = 64
 SGD_EVAL_EVERY  = 10
 AMP_DAMPING     = 0.7
+AMP_INIT_SCALE  = 1e-3
+IAMP_PDE_XMAX   = 6.0
+IAMP_PDE_NX     = 401
 SPECTRAL_REFINE = True
 
-ALGO_COLORS  = {'GD': '#E91E63', 'SGD': '#7E57C2', 'AMP': '#00BCD4', 'SPEC': '#FF9800'}
+ALGO_COLORS  = {
+    'GD':    '#E91E63',
+    'SGD':   '#7E57C2',
+    'AMP':   '#00BCD4',
+    'AMP-T': '#26A69A',
+    'IAMP':  '#5C6BC0',
+    'SPEC':  '#FF9800',
+}
 ITER_COLORS  = {100: '#FF6B6B', 250: '#4ECDC4', 500: '#45B7D1', 1000: '#2E86AB'}
 ITER_MARKERS = {100: 'o', 250: 's', 500: '^', 1000: 'D'}
 N_COLORS     = {500: '#E91E63', 1000: '#7E57C2', 2000: '#00BCD4', 5000: '#FF9800'}
@@ -218,6 +380,8 @@ print(f'N values (Exp 3):        {EXP3_N_VALUES}')
 print(f'Restart sweep (Exp 3):   {EXP3_RESTART_VALUES}')
 print(f'AMP iters per restart:   {EXP3_AMP_ITERS}')
 print(f'Seeds (Exp 3):           {EXP3_NUM_SEEDS}')
+print(f'AMP init scale:          {AMP_INIT_SCALE}')
+print(f'IAMP PDE grid:           nx={IAMP_PDE_NX}, xmax={IAMP_PDE_XMAX}')
 
 
 # =============================================================================
@@ -237,10 +401,17 @@ for ITER in ITERATION_VALUES:
         cell_idx += 1
         theoretical_limit = PARISI_VALUE * N
 
-        gd_energies, sgd_energies, amp_energies, spec_energies = [], [], [], []
-        gd_walls,    sgd_walls,    amp_walls,    spec_walls    = [], [], [], []
-        gd_flops_list, sgd_flops_list, amp_flops_list, spec_flops_list = [], [], [], []
+        gd_energies, sgd_energies, amp_energies, ampt_energies, iamp_energies, spec_energies = (
+            [], [], [], [], [], [])
+        gd_walls, sgd_walls, amp_walls, ampt_walls, iamp_walls, spec_walls = (
+            [], [], [], [], [], [])
+        gd_flops_list, sgd_flops_list, amp_flops_list, ampt_flops_list, iamp_flops_list, spec_flops_list = (
+            [], [], [], [], [], [])
         gd_conv_iters = []
+
+        # IAMP PDE solve is shared across all seeds at this (N, ITER) cell.
+        iamp_x_grid, iamp_dPhi_dx = precompute_iamp_pde(
+            ITER, pde_xmax=IAMP_PDE_XMAX, pde_nx=IAMP_PDE_NX)
 
         for seed in range(NUM_SEEDS):
             rng = np.random.default_rng(seed)
@@ -261,13 +432,33 @@ for ITER in ITERATION_VALUES:
             sgd_energies.append(sgd_curve[-1])
             sgd_flops_list.append(flops_sgd(N, ITER, min(SGD_BATCH_SIZE, N), len(sgd_curve)))
 
-            m_init = get_orthogonal_start(N, rng)
+            m_init = get_orthogonal_starts(1, N, rng, scale=AMP_INIT_SCALE)[0]
             t0 = time.perf_counter()
             raw = amp_sk(J, m_init, ITER, AMP_DAMPING)
             quenched, qp = greedy_quench(raw, J)
             amp_walls.append(time.perf_counter() - t0)
             amp_energies.append(float(calculate_energy(quenched, J)))
             amp_flops_list.append(flops_amp_single(N, ITER, qp))
+
+            t0 = time.perf_counter()
+            raw_t = amp_traditional_sk(J, m_init, ITER)
+            quenched_t, qp_t = greedy_quench(raw_t, J)
+            ampt_walls.append(time.perf_counter() - t0)
+            ampt_energies.append(float(calculate_energy(quenched_t, J)))
+            ampt_flops_list.append(flops_amp_single(N, ITER, qp_t))
+
+            t0 = time.perf_counter()
+            raw_i = iamp_sk(
+                J, m_init, ITER, AMP_DAMPING,
+                pde_xmax=IAMP_PDE_XMAX, pde_nx=IAMP_PDE_NX,
+                x_grid=iamp_x_grid, dPhi_dx=iamp_dPhi_dx)
+            quenched_i, qp_i = greedy_quench(raw_i, J)
+            iamp_walls.append(time.perf_counter() - t0)
+            iamp_energies.append(float(calculate_energy(quenched_i, J)))
+            # PDE cost amortized across seeds in the cell — count it on first seed only.
+            iamp_flops_list.append(flops_iamp_single(
+                N, ITER, qp_i, IAMP_PDE_NX, ITER,
+                include_pde=(seed == 0)))
 
             t0 = time.perf_counter()
             spec_spins, spec_info = spectral_sk(J, refine=SPECTRAL_REFINE)
@@ -282,6 +473,8 @@ for ITER in ITERATION_VALUES:
         gd_e_mean,   gd_e_std   = stats(gd_energies)
         sgd_e_mean,  sgd_e_std  = stats(sgd_energies)
         amp_e_mean,  amp_e_std  = stats(amp_energies)
+        ampt_e_mean, ampt_e_std = stats(ampt_energies)
+        iamp_e_mean, iamp_e_std = stats(iamp_energies)
         spec_e_mean, spec_e_std = stats(spec_energies)
 
         def gap_pct(e): return 100 * abs(e - theoretical_limit) / abs(theoretical_limit)
@@ -290,6 +483,8 @@ for ITER in ITERATION_VALUES:
               f'GD: {gd_e_mean/N:+.4f}  '
               f'SGD: {sgd_e_mean/N:+.4f}  '
               f'AMP: {amp_e_mean/N:+.4f}  '
+              f'AMP-T: {ampt_e_mean/N:+.4f}  '
+              f'IAMP: {iamp_e_mean/N:+.4f}  '
               f'SPEC: {spec_e_mean/N:+.4f}  '
               f'PARISI: {PARISI_VALUE:+.4f}')
 
@@ -302,26 +497,37 @@ for ITER in ITERATION_VALUES:
             gd_mean_eN        = round(gd_e_mean / N, 5),
             sgd_mean_eN       = round(sgd_e_mean / N, 5),
             amp_mean_eN       = round(amp_e_mean / N, 5),
+            ampt_mean_eN      = round(ampt_e_mean / N, 5),
+            iamp_mean_eN      = round(iamp_e_mean / N, 5),
             spec_mean_eN      = round(spec_e_mean / N, 5),
             gd_std_eN         = round(gd_e_std / N, 5),
             sgd_std_eN        = round(sgd_e_std / N, 5),
             amp_std_eN        = round(amp_e_std / N, 5),
+            ampt_std_eN       = round(ampt_e_std / N, 5),
+            iamp_std_eN       = round(iamp_e_std / N, 5),
             spec_std_eN       = round(spec_e_std / N, 5),
             gd_gap_pct        = round(gap_pct(gd_e_mean), 3),
             sgd_gap_pct       = round(gap_pct(sgd_e_mean), 3),
             amp_gap_pct       = round(gap_pct(amp_e_mean), 3),
+            ampt_gap_pct      = round(gap_pct(ampt_e_mean), 3),
+            iamp_gap_pct      = round(gap_pct(iamp_e_mean), 3),
             spec_gap_pct      = round(gap_pct(spec_e_mean), 3),
             gd_wall_sec       = round(np.mean(gd_walls), 5),
             sgd_wall_sec      = round(np.mean(sgd_walls), 5),
             amp_wall_sec      = round(np.mean(amp_walls), 5),
+            ampt_wall_sec     = round(np.mean(ampt_walls), 5),
+            iamp_wall_sec     = round(np.mean(iamp_walls), 5),
             spec_wall_sec     = round(np.mean(spec_walls), 5),
             gd_flops          = int(np.mean(gd_flops_list)),
             sgd_flops         = int(np.mean(sgd_flops_list)),
             amp_flops         = int(np.mean(amp_flops_list)),
+            ampt_flops        = int(np.mean(ampt_flops_list)),
+            iamp_flops        = int(np.mean(iamp_flops_list)),
             spec_flops        = int(np.mean(spec_flops_list)),
             winner            = min(
                 [('GD', gd_e_mean), ('SGD', sgd_e_mean),
-                 ('AMP', amp_e_mean), ('SPEC', spec_e_mean)],
+                 ('AMP', amp_e_mean), ('AMP-T', ampt_e_mean),
+                 ('IAMP', iamp_e_mean), ('SPEC', spec_e_mean)],
                 key=lambda x: x[1])[0],
             num_seeds         = NUM_SEEDS,
         ))
@@ -373,9 +579,16 @@ for ITER in ITERATION_VALUES:
         sgd_wall = time.perf_counter() - t_sgd_start
 
         amp_best = np.inf; amp_restarts = 0; amp_total_flops = 0
+        amp_batch_size = min(N, 64)
+        amp_starts = get_orthogonal_starts(amp_batch_size, N, rng, scale=AMP_INIT_SCALE)
+        amp_start_idx = 0
         t_amp_start = time.perf_counter()
         while time.perf_counter() - t_amp_start < TIME_BUDGET_SEC:
-            m_init = get_orthogonal_start(N, rng)
+            if amp_start_idx >= len(amp_starts):
+                amp_starts = get_orthogonal_starts(amp_batch_size, N, rng, scale=AMP_INIT_SCALE)
+                amp_start_idx = 0
+            m_init = amp_starts[amp_start_idx]
+            amp_start_idx += 1
             raw = amp_sk(J, m_init, ITER, AMP_DAMPING)
             quenched, qp = greedy_quench(raw, J)
             e = float(calculate_energy(quenched, J))
@@ -383,6 +596,51 @@ for ITER in ITERATION_VALUES:
             amp_total_flops += flops_amp_single(N, ITER, qp)
             amp_restarts += 1
         amp_wall = time.perf_counter() - t_amp_start
+
+        ampt_best = np.inf; ampt_restarts = 0; ampt_total_flops = 0
+        ampt_starts = get_orthogonal_starts(amp_batch_size, N, rng, scale=AMP_INIT_SCALE)
+        ampt_start_idx = 0
+        t_ampt_start = time.perf_counter()
+        while time.perf_counter() - t_ampt_start < TIME_BUDGET_SEC:
+            if ampt_start_idx >= len(ampt_starts):
+                ampt_starts = get_orthogonal_starts(amp_batch_size, N, rng, scale=AMP_INIT_SCALE)
+                ampt_start_idx = 0
+            m_init = ampt_starts[ampt_start_idx]
+            ampt_start_idx += 1
+            raw = amp_traditional_sk(J, m_init, ITER)
+            quenched, qp = greedy_quench(raw, J)
+            e = float(calculate_energy(quenched, J))
+            if e < ampt_best: ampt_best = e
+            ampt_total_flops += flops_amp_single(N, ITER, qp)
+            ampt_restarts += 1
+        ampt_wall = time.perf_counter() - t_ampt_start
+
+        # IAMP: solve PDE once, reuse across all restarts in this cell.
+        iamp_x_grid, iamp_dPhi_dx = precompute_iamp_pde(
+            ITER, pde_xmax=IAMP_PDE_XMAX, pde_nx=IAMP_PDE_NX)
+        iamp_best = np.inf; iamp_restarts = 0; iamp_total_flops = 0
+        iamp_starts = get_orthogonal_starts(amp_batch_size, N, rng, scale=AMP_INIT_SCALE)
+        iamp_start_idx = 0
+        t_iamp_start = time.perf_counter()
+        while time.perf_counter() - t_iamp_start < TIME_BUDGET_SEC:
+            if iamp_start_idx >= len(iamp_starts):
+                iamp_starts = get_orthogonal_starts(amp_batch_size, N, rng, scale=AMP_INIT_SCALE)
+                iamp_start_idx = 0
+            m_init = iamp_starts[iamp_start_idx]
+            iamp_start_idx += 1
+            raw = iamp_sk(
+                J, m_init, ITER, AMP_DAMPING,
+                pde_xmax=IAMP_PDE_XMAX, pde_nx=IAMP_PDE_NX,
+                x_grid=iamp_x_grid, dPhi_dx=iamp_dPhi_dx)
+            quenched, qp = greedy_quench(raw, J)
+            e = float(calculate_energy(quenched, J))
+            if e < iamp_best: iamp_best = e
+            # PDE cost counted only once for the cell.
+            iamp_total_flops += flops_iamp_single(
+                N, ITER, qp, IAMP_PDE_NX, ITER,
+                include_pde=(iamp_restarts == 0))
+            iamp_restarts += 1
+        iamp_wall = time.perf_counter() - t_iamp_start
 
         eigenvalues, eigenvectors = eigsh(
             J, k=1, which='LA', return_eigenvectors=True, maxiter=1000, tol=1e-6)
@@ -410,6 +668,8 @@ for ITER in ITERATION_VALUES:
               f'GD: {gd_best/N:+.4f} (x{gd_restarts})  '
               f'SGD: {sgd_best/N:+.4f} (x{sgd_restarts})  '
               f'AMP: {amp_best/N:+.4f} (x{amp_restarts})  '
+              f'AMP-T: {ampt_best/N:+.4f} (x{ampt_restarts})  '
+              f'IAMP: {iamp_best/N:+.4f} (x{iamp_restarts})  '
               f'SPEC: {spec_best/N:+.4f} (x{spec_restarts})')
 
         exp2_records.append(dict(
@@ -422,26 +682,37 @@ for ITER in ITERATION_VALUES:
             gd_best_eN        = round(gd_best / N, 5),
             sgd_best_eN       = round(sgd_best / N, 5),
             amp_best_eN       = round(amp_best / N, 5),
+            ampt_best_eN      = round(ampt_best / N, 5),
+            iamp_best_eN      = round(iamp_best / N, 5),
             spec_best_eN      = round(spec_best / N, 5),
             gd_gap_pct        = round(gap_pct(gd_best), 3),
             sgd_gap_pct       = round(gap_pct(sgd_best), 3),
             amp_gap_pct       = round(gap_pct(amp_best), 3),
+            ampt_gap_pct      = round(gap_pct(ampt_best), 3),
+            iamp_gap_pct      = round(gap_pct(iamp_best), 3),
             spec_gap_pct      = round(gap_pct(spec_best), 3),
             gd_restarts       = gd_restarts,
             sgd_restarts      = sgd_restarts,
             amp_restarts      = amp_restarts,
+            ampt_restarts     = ampt_restarts,
+            iamp_restarts     = iamp_restarts,
             spec_restarts     = spec_restarts,
             gd_wall_sec       = round(gd_wall, 3),
             sgd_wall_sec      = round(sgd_wall, 3),
             amp_wall_sec      = round(amp_wall, 3),
+            ampt_wall_sec     = round(ampt_wall, 3),
+            iamp_wall_sec     = round(iamp_wall, 3),
             spec_wall_sec     = round(spec_wall, 3),
             gd_flops          = gd_total_flops,
             sgd_flops         = sgd_total_flops,
             amp_flops         = amp_total_flops,
+            ampt_flops        = ampt_total_flops,
+            iamp_flops        = iamp_total_flops,
             spec_flops        = spec_total_flops,
             winner            = min(
                 [('GD', gd_best), ('SGD', sgd_best),
-                 ('AMP', amp_best), ('SPEC', spec_best)],
+                 ('AMP', amp_best), ('AMP-T', ampt_best),
+                 ('IAMP', iamp_best), ('SPEC', spec_best)],
                 key=lambda x: x[1])[0],
         ))
 
@@ -450,7 +721,7 @@ print(f'\n✓ Experiment 2 complete. {len(df2)} records.')
 
 
 # =============================================================================
-# 6. Experiment 3 — AMP vs Spectral: restart sweep (optimality-seeking)
+# 6. Experiment 3 — AMP variants vs Spectral: restart sweep (optimality-seeking)
 #
 #   GD and SGD are dropped — we already know they underperform.
 #   Both AMP and Spectral are given exactly R restarts from the sweep
@@ -467,7 +738,7 @@ print(f'\n✓ Experiment 2 complete. {len(df2)} records.')
 # =============================================================================
 
 print('\n' + '='*70)
-print('EXPERIMENT 3: AMP vs Spectral — Restart Budget Sweep')
+print('EXPERIMENT 3: AMP variants vs Spectral — Restart Budget Sweep')
 print(f'  N values:        {EXP3_N_VALUES}')
 print(f'  Restart values:  {EXP3_RESTART_VALUES}')
 print(f'  AMP iters/run:   {EXP3_AMP_ITERS}')
@@ -485,11 +756,21 @@ for N in EXP3_N_VALUES:
         cell_idx += 1
 
         amp_best_list  = []
+        ampt_best_list = []
+        iamp_best_list = []
         spec_best_list = []
         amp_wall_list  = []
+        ampt_wall_list = []
+        iamp_wall_list = []
         spec_wall_list = []
         amp_flops_list = []
-        spec_flops_list= []
+        ampt_flops_list = []
+        iamp_flops_list = []
+        spec_flops_list = []
+
+        # IAMP PDE solve is reused across all seeds and restarts in this cell.
+        iamp_x_grid, iamp_dPhi_dx = precompute_iamp_pde(
+            EXP3_AMP_ITERS, pde_xmax=IAMP_PDE_XMAX, pde_nx=IAMP_PDE_NX)
 
         for seed in range(EXP3_NUM_SEEDS):
             rng = np.random.default_rng(seed * 1000 + N)
@@ -499,8 +780,8 @@ for N in EXP3_N_VALUES:
             amp_best = np.inf
             amp_total_flops = 0
             t0 = time.perf_counter()
-            for _ in range(num_restarts):
-                m_init = get_orthogonal_start(N, rng)
+            amp_starts = get_orthogonal_starts(num_restarts, N, rng, scale=AMP_INIT_SCALE)
+            for m_init in amp_starts:
                 raw = amp_sk(J, m_init, EXP3_AMP_ITERS, AMP_DAMPING)
                 quenched, qp = greedy_quench(raw, J)
                 e = float(calculate_energy(quenched, J))
@@ -508,6 +789,38 @@ for N in EXP3_N_VALUES:
                     amp_best = e
                 amp_total_flops += flops_amp_single(N, EXP3_AMP_ITERS, qp)
             amp_wall = time.perf_counter() - t0
+
+            # ── AMP-T: traditional (no damping), same starts ──────────────────
+            ampt_best = np.inf
+            ampt_total_flops = 0
+            t0 = time.perf_counter()
+            for m_init in amp_starts:
+                raw = amp_traditional_sk(J, m_init, EXP3_AMP_ITERS)
+                quenched, qp = greedy_quench(raw, J)
+                e = float(calculate_energy(quenched, J))
+                if e < ampt_best:
+                    ampt_best = e
+                ampt_total_flops += flops_amp_single(N, EXP3_AMP_ITERS, qp)
+            ampt_wall = time.perf_counter() - t0
+
+            # ── IAMP: same starts, Parisi-PDE-driven nonlinearity ─────────────
+            iamp_best = np.inf
+            iamp_total_flops = 0
+            t0 = time.perf_counter()
+            for r_idx, m_init in enumerate(amp_starts):
+                raw = iamp_sk(
+                    J, m_init, EXP3_AMP_ITERS, AMP_DAMPING,
+                    pde_xmax=IAMP_PDE_XMAX, pde_nx=IAMP_PDE_NX,
+                    x_grid=iamp_x_grid, dPhi_dx=iamp_dPhi_dx)
+                quenched, qp = greedy_quench(raw, J)
+                e = float(calculate_energy(quenched, J))
+                if e < iamp_best:
+                    iamp_best = e
+                # Charge PDE cost once per seed (first restart).
+                iamp_total_flops += flops_iamp_single(
+                    N, EXP3_AMP_ITERS, qp, IAMP_PDE_NX, EXP3_AMP_ITERS,
+                    include_pde=(r_idx == 0))
+            iamp_wall = time.perf_counter() - t0
 
             # ── Spectral: eigenvector computed once, then num_restarts quenches ─
             # Restart 0: standard sign rounding of eigenvector.
@@ -539,32 +852,56 @@ for N in EXP3_N_VALUES:
             spec_wall = (time.perf_counter() - t0) + eig_time
 
             amp_best_list.append(amp_best)
+            ampt_best_list.append(ampt_best)
+            iamp_best_list.append(iamp_best)
             spec_best_list.append(spec_best)
             amp_wall_list.append(amp_wall)
+            ampt_wall_list.append(ampt_wall)
+            iamp_wall_list.append(iamp_wall)
             spec_wall_list.append(spec_wall)
             amp_flops_list.append(amp_total_flops)
+            ampt_flops_list.append(ampt_total_flops)
+            iamp_flops_list.append(iamp_total_flops)
             spec_flops_list.append(spec_total_flops)
 
         amp_mean_eN  = np.mean(amp_best_list)  / N
+        ampt_mean_eN = np.mean(ampt_best_list) / N
+        iamp_mean_eN = np.mean(iamp_best_list) / N
         spec_mean_eN = np.mean(spec_best_list) / N
-        amp_gap      = 100 * abs(np.mean(amp_best_list)  - theoretical_limit) / abs(theoretical_limit)
-        spec_gap     = 100 * abs(np.mean(spec_best_list) - theoretical_limit) / abs(theoretical_limit)
+        amp_gap   = 100 * abs(np.mean(amp_best_list)  - theoretical_limit) / abs(theoretical_limit)
+        ampt_gap  = 100 * abs(np.mean(ampt_best_list) - theoretical_limit) / abs(theoretical_limit)
+        iamp_gap  = 100 * abs(np.mean(iamp_best_list) - theoretical_limit) / abs(theoretical_limit)
+        spec_gap  = 100 * abs(np.mean(spec_best_list) - theoretical_limit) / abs(theoretical_limit)
         amp_wall_mean  = np.mean(amp_wall_list)
+        ampt_wall_mean = np.mean(ampt_wall_list)
+        iamp_wall_mean = np.mean(iamp_wall_list)
         spec_wall_mean = np.mean(spec_wall_list)
         amp_flops_mean  = int(np.mean(amp_flops_list))
+        ampt_flops_mean = int(np.mean(ampt_flops_list))
+        iamp_flops_mean = int(np.mean(iamp_flops_list))
         spec_flops_mean = int(np.mean(spec_flops_list))
-        flop_ratio = amp_flops_mean / max(spec_flops_mean, 1)
-        quality_gap_pp = amp_gap - spec_gap   # positive = AMP is closer to Parisi
+        flop_ratio      = amp_flops_mean  / max(spec_flops_mean, 1)
+        ampt_flop_ratio = ampt_flops_mean / max(spec_flops_mean, 1)
+        iamp_flop_ratio = iamp_flops_mean / max(spec_flops_mean, 1)
+        # All "advantage" deltas: positive = that variant is closer to Parisi than Spectral.
+        quality_gap_pp      = amp_gap  - spec_gap
+        ampt_quality_gap_pp = ampt_gap - spec_gap
+        iamp_quality_gap_pp = iamp_gap - spec_gap
 
-        winner = 'AMP' if amp_mean_eN < spec_mean_eN else 'SPEC'
+        winner = min(
+            [('AMP', amp_mean_eN), ('AMP-T', ampt_mean_eN),
+             ('IAMP', iamp_mean_eN), ('SPEC', spec_mean_eN)],
+            key=lambda x: x[1])[0]
 
         print(f'[{cell_idx:02d}/{total_cells_3}]  N={N:>5d}  restarts={num_restarts:<4d}  '
               f'AMP: {amp_mean_eN:+.4f}  '
+              f'AMP-T: {ampt_mean_eN:+.4f}  '
+              f'IAMP: {iamp_mean_eN:+.4f}  '
               f'SPEC: {spec_mean_eN:+.4f}  '
               f'PARISI: {PARISI_VALUE:+.4f}  '
-              f'| AMP_gap: {amp_gap:.2f}%  SPEC_gap: {spec_gap:.2f}%  '
-              f'| AMP_t: {amp_wall_mean:.2f}s  SPEC_t: {spec_wall_mean:.3f}s  '
-              f'| FLOP_ratio: {flop_ratio:.1f}x')
+              f'| gap AMP/AMP-T/IAMP/SPEC: {amp_gap:.2f}/{ampt_gap:.2f}/{iamp_gap:.2f}/{spec_gap:.2f}%  '
+              f'| t AMP/AMP-T/IAMP/SPEC: {amp_wall_mean:.2f}/{ampt_wall_mean:.2f}/{iamp_wall_mean:.2f}/{spec_wall_mean:.3f}s  '
+              f'| FLOP ratios vs SPEC: {flop_ratio:.1f}/{ampt_flop_ratio:.1f}/{iamp_flop_ratio:.1f}x')
 
         exp3_records.append(dict(
             experiment        = 3,
@@ -575,18 +912,32 @@ for N in EXP3_N_VALUES:
             parisi_value      = PARISI_VALUE,
             # Quality
             amp_mean_eN       = round(amp_mean_eN, 5),
+            ampt_mean_eN      = round(ampt_mean_eN, 5),
+            iamp_mean_eN      = round(iamp_mean_eN, 5),
             spec_mean_eN      = round(spec_mean_eN, 5),
             amp_gap_pct       = round(amp_gap, 3),
+            ampt_gap_pct      = round(ampt_gap, 3),
+            iamp_gap_pct      = round(iamp_gap, 3),
             spec_gap_pct      = round(spec_gap, 3),
-            quality_gap_pp    = round(quality_gap_pp, 3),  # AMP advantage in pp (negative = SPEC wins)
+            quality_gap_pp    = round(quality_gap_pp, 3),
+            ampt_quality_gap_pp = round(ampt_quality_gap_pp, 3),
+            iamp_quality_gap_pp = round(iamp_quality_gap_pp, 3),
             # Timing
             amp_wall_sec      = round(amp_wall_mean, 4),
+            ampt_wall_sec     = round(ampt_wall_mean, 4),
+            iamp_wall_sec     = round(iamp_wall_mean, 4),
             spec_wall_sec     = round(spec_wall_mean, 4),
-            wall_ratio        = round(amp_wall_mean / max(spec_wall_mean, 1e-9), 2),
+            wall_ratio        = round(amp_wall_mean  / max(spec_wall_mean, 1e-9), 2),
+            ampt_wall_ratio   = round(ampt_wall_mean / max(spec_wall_mean, 1e-9), 2),
+            iamp_wall_ratio   = round(iamp_wall_mean / max(spec_wall_mean, 1e-9), 2),
             # FLOPs
             amp_flops         = amp_flops_mean,
+            ampt_flops        = ampt_flops_mean,
+            iamp_flops        = iamp_flops_mean,
             spec_flops        = spec_flops_mean,
             flop_ratio        = round(flop_ratio, 1),
+            ampt_flop_ratio   = round(ampt_flop_ratio, 1),
+            iamp_flop_ratio   = round(iamp_flop_ratio, 1),
             winner            = winner,
             num_seeds         = EXP3_NUM_SEEDS,
         ))
@@ -614,9 +965,9 @@ print('EXPERIMENT 1 SUMMARY — Mean Relative Gap to Parisi Value (%)')
 print(f'(single run per instance, averaged over {NUM_SEEDS} seeds)')
 print('='*70)
 gap1 = df1.groupby('iterations')[
-    ['gd_gap_pct', 'sgd_gap_pct', 'amp_gap_pct', 'spec_gap_pct']
+    ['gd_gap_pct', 'sgd_gap_pct', 'amp_gap_pct', 'ampt_gap_pct', 'iamp_gap_pct', 'spec_gap_pct']
 ].mean().round(2)
-gap1.columns = ['GD', 'SGD', 'AMP', 'Spectral']
+gap1.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 print(gap1.to_string())
 
 print('\n' + '='*70)
@@ -630,6 +981,8 @@ for iter_val in ITERATION_VALUES:
               f"GD: {row.gd_mean_eN:+.4f}  "
               f"SGD: {row.sgd_mean_eN:+.4f}  "
               f"AMP: {row.amp_mean_eN:+.4f}  "
+              f"AMP-T: {row.ampt_mean_eN:+.4f}  "
+              f"IAMP: {row.iamp_mean_eN:+.4f}  "
               f"SPEC: {row.spec_mean_eN:+.4f}  "
               f"PARISI: {PARISI_VALUE:+.4f}")
 
@@ -637,18 +990,18 @@ print('\n' + '='*70)
 print('EXPERIMENT 1 SUMMARY — Mean wall time (s) per single run')
 print('='*70)
 time1 = df1.groupby('iterations')[
-    ['gd_wall_sec', 'sgd_wall_sec', 'amp_wall_sec', 'spec_wall_sec']
+    ['gd_wall_sec', 'sgd_wall_sec', 'amp_wall_sec', 'ampt_wall_sec', 'iamp_wall_sec', 'spec_wall_sec']
 ].mean().round(4)
-time1.columns = ['GD', 'SGD', 'AMP', 'Spectral']
+time1.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 print(time1.to_string())
 
 print('\n' + '='*70)
 print('EXPERIMENT 1 SUMMARY — Mean FLOPs per single run')
 print('='*70)
 flop1 = df1.groupby('iterations')[
-    ['gd_flops', 'sgd_flops', 'amp_flops', 'spec_flops']
+    ['gd_flops', 'sgd_flops', 'amp_flops', 'ampt_flops', 'iamp_flops', 'spec_flops']
 ].mean()
-flop1.columns = ['GD', 'SGD', 'AMP', 'Spectral']
+flop1.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 flop1_fmt = flop1.copy()
 for col in flop1_fmt.columns:
     flop1_fmt[col] = flop1_fmt[col].apply(lambda x: f'{x:.2e}')
@@ -658,40 +1011,42 @@ print('\n' + '='*70)
 print(f'EXPERIMENT 2 SUMMARY — Best gap within {TIME_BUDGET_SEC}s budget (%)')
 print('='*70)
 gap2 = df2.groupby('iterations')[
-    ['gd_gap_pct', 'sgd_gap_pct', 'amp_gap_pct', 'spec_gap_pct']
+    ['gd_gap_pct', 'sgd_gap_pct', 'amp_gap_pct', 'ampt_gap_pct', 'iamp_gap_pct', 'spec_gap_pct']
 ].mean().round(2)
-gap2.columns = ['GD', 'SGD', 'AMP', 'Spectral']
+gap2.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 print(gap2.to_string())
 
 print('\n' + '='*70)
 print(f'EXPERIMENT 2 SUMMARY — Mean restarts completed within {TIME_BUDGET_SEC}s')
 print('='*70)
 restarts2 = df2.groupby('iterations')[
-    ['gd_restarts', 'sgd_restarts', 'amp_restarts', 'spec_restarts']
+    ['gd_restarts', 'sgd_restarts', 'amp_restarts', 'ampt_restarts', 'iamp_restarts', 'spec_restarts']
 ].mean().round(1)
-restarts2.columns = ['GD', 'SGD', 'AMP', 'Spectral']
+restarts2.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 print(restarts2.to_string())
 
 print('\n' + '='*70)
-print('EXPERIMENT 3 SUMMARY — AMP vs Spectral gap (%) by N and restart count')
-print(f'(AMP uses {EXP3_AMP_ITERS} iterations/restart, averaged over {EXP3_NUM_SEEDS} seeds)')
+print('EXPERIMENT 3 SUMMARY — AMP variants vs Spectral gap (%) by N and restart count')
+print(f'(AMP/AMP-T/IAMP use {EXP3_AMP_ITERS} iterations/restart, averaged over {EXP3_NUM_SEEDS} seeds)')
 print('='*70)
 for N in EXP3_N_VALUES:
     sub = df3[df3['N'] == N]
     print(f'\n  N={N}:')
-    print(f"    {'restarts':>8}  {'AMP gap%':>9}  {'SPEC gap%':>10}  "
-          f"{'AMP adv (pp)':>13}  {'AMP time(s)':>11}  "
-          f"{'SPEC time(s)':>12}  {'time ratio':>10}  {'FLOP ratio':>10}")
+    print(f"    {'restarts':>8}  {'AMP':>7}  {'AMP-T':>7}  {'IAMP':>7}  {'SPEC':>7}  "
+          f"{'AMP adv':>9}  {'IAMP adv':>9}  {'AMP t(s)':>9}  {'IAMP t(s)':>10}  {'SPEC t(s)':>10}")
     for _, row in sub.iterrows():
-        adv = -row.quality_gap_pp   # positive = AMP is better (smaller gap)
+        amp_adv  = -row.quality_gap_pp       # positive = AMP closer to Parisi
+        iamp_adv = -row.iamp_quality_gap_pp  # positive = IAMP closer to Parisi
         print(f"    {int(row.num_restarts):>8}  "
-              f"{row.amp_gap_pct:>9.2f}  "
-              f"{row.spec_gap_pct:>10.2f}  "
-              f"{adv:>+13.2f}  "
-              f"{row.amp_wall_sec:>11.3f}  "
-              f"{row.spec_wall_sec:>12.4f}  "
-              f"{row.wall_ratio:>10.1f}x  "
-              f"{row.flop_ratio:>10.1f}x")
+              f"{row.amp_gap_pct:>7.2f}  "
+              f"{row.ampt_gap_pct:>7.2f}  "
+              f"{row.iamp_gap_pct:>7.2f}  "
+              f"{row.spec_gap_pct:>7.2f}  "
+              f"{amp_adv:>+9.2f}  "
+              f"{iamp_adv:>+9.2f}  "
+              f"{row.amp_wall_sec:>9.3f}  "
+              f"{row.iamp_wall_sec:>10.3f}  "
+              f"{row.spec_wall_sec:>10.4f}")
 
 print('\n' + '='*70)
 print('EXPERIMENT 3 SUMMARY — FLOP cost at each restart count')
@@ -699,12 +1054,16 @@ print('='*70)
 for N in EXP3_N_VALUES:
     sub = df3[df3['N'] == N]
     print(f'\n  N={N}:')
-    print(f"    {'restarts':>8}  {'AMP FLOPs':>12}  {'SPEC FLOPs':>12}  {'ratio':>8}")
+    print(f"    {'restarts':>8}  {'AMP FLOPs':>12}  {'AMP-T FLOPs':>12}  "
+          f"{'IAMP FLOPs':>12}  {'SPEC FLOPs':>12}  {'AMP/SPEC':>9}  {'IAMP/SPEC':>10}")
     for _, row in sub.iterrows():
         print(f"    {int(row.num_restarts):>8}  "
               f"{row.amp_flops:>12.3e}  "
+              f"{row.ampt_flops:>12.3e}  "
+              f"{row.iamp_flops:>12.3e}  "
               f"{row.spec_flops:>12.3e}  "
-              f"{row.flop_ratio:>8.1f}x")
+              f"{row.flop_ratio:>9.1f}x  "
+              f"{row.iamp_flop_ratio:>10.1f}x")
 
 print('\n' + '='*70)
 print('Win rates — Experiment 1 (single run)')
@@ -739,17 +1098,19 @@ for ax, iter_val in zip(axes, ITERATION_VALUES):
         ('GD',      'gd_gap_pct',   'gd_std_eN',   'o'),
         ('SGD',     'sgd_gap_pct',  'sgd_std_eN',  '^'),
         ('AMP',     'amp_gap_pct',  'amp_std_eN',  's'),
+        ('AMP-T',   'ampt_gap_pct', 'ampt_std_eN', 'P'),
+        ('IAMP',    'iamp_gap_pct', 'iamp_std_eN', 'X'),
         ('Spectral','spec_gap_pct', 'spec_std_eN', 'D'),
     ]:
         key = 'SPEC' if algo == 'Spectral' else algo
         means = sub[col_mean].values
         stds  = sub[col_std].values * 100
         ax.plot(sub['N'], means, marker=marker, lw=2, color=ALGO_COLORS[key], label=algo)
-        ax.fill_between(sub['N'], means - stds, means + stds, alpha=0.15, color=ALGO_COLORS[key])
+        ax.fill_between(sub['N'], means - stds, means + stds, alpha=0.10, color=ALGO_COLORS[key])
     ax.set_title(f'{iter_val} iterations', fontsize=11)
     ax.set_xlabel('N')
     ax.set_ylabel('Relative gap to Parisi (%)')
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
     ax.set_yscale('log')
 plt.tight_layout()
@@ -764,14 +1125,16 @@ fig.suptitle(f'Experiment 2: Best Gap within {TIME_BUDGET_SEC}s Budget',
              fontsize=13, fontweight='bold')
 for ax, iter_val in zip(axes, ITERATION_VALUES):
     sub = df2[df2['iterations'] == iter_val]
-    ax.semilogy(sub['N'], sub['gd_gap_pct'],   'o-', color=ALGO_COLORS['GD'],   label='GD',       lw=2)
-    ax.semilogy(sub['N'], sub['sgd_gap_pct'],  '^-', color=ALGO_COLORS['SGD'],  label='SGD',      lw=2)
-    ax.semilogy(sub['N'], sub['amp_gap_pct'],  's-', color=ALGO_COLORS['AMP'],  label='AMP',      lw=2)
-    ax.semilogy(sub['N'], sub['spec_gap_pct'], 'D-', color=ALGO_COLORS['SPEC'], label='Spectral', lw=2)
+    ax.semilogy(sub['N'], sub['gd_gap_pct'],   'o-', color=ALGO_COLORS['GD'],    label='GD',       lw=2)
+    ax.semilogy(sub['N'], sub['sgd_gap_pct'],  '^-', color=ALGO_COLORS['SGD'],   label='SGD',      lw=2)
+    ax.semilogy(sub['N'], sub['amp_gap_pct'],  's-', color=ALGO_COLORS['AMP'],   label='AMP',      lw=2)
+    ax.semilogy(sub['N'], sub['ampt_gap_pct'], 'P-', color=ALGO_COLORS['AMP-T'], label='AMP-T',    lw=2)
+    ax.semilogy(sub['N'], sub['iamp_gap_pct'], 'X-', color=ALGO_COLORS['IAMP'],  label='IAMP',     lw=2)
+    ax.semilogy(sub['N'], sub['spec_gap_pct'], 'D-', color=ALGO_COLORS['SPEC'],  label='Spectral', lw=2)
     ax.set_title(f'{iter_val} iterations', fontsize=11)
     ax.set_xlabel('N')
     ax.set_ylabel('Relative gap to Parisi (%)')
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(alpha=0.3, which='both')
 plt.tight_layout()
 plt.savefig('fig_exp2_gap_vs_N.png', dpi=150, bbox_inches='tight')
@@ -785,14 +1148,16 @@ fig.suptitle(f'Experiment 2: Restarts Completed within {TIME_BUDGET_SEC}s',
              fontsize=13, fontweight='bold')
 for ax, iter_val in zip(axes, ITERATION_VALUES):
     sub = df2[df2['iterations'] == iter_val]
-    ax.semilogy(sub['N'], sub['gd_restarts'],   'o-', color=ALGO_COLORS['GD'],   label='GD',       lw=2)
-    ax.semilogy(sub['N'], sub['sgd_restarts'],  '^-', color=ALGO_COLORS['SGD'],  label='SGD',      lw=2)
-    ax.semilogy(sub['N'], sub['amp_restarts'],  's-', color=ALGO_COLORS['AMP'],  label='AMP',      lw=2)
-    ax.semilogy(sub['N'], sub['spec_restarts'], 'D-', color=ALGO_COLORS['SPEC'], label='Spectral', lw=2)
+    ax.semilogy(sub['N'], sub['gd_restarts'],   'o-', color=ALGO_COLORS['GD'],    label='GD',       lw=2)
+    ax.semilogy(sub['N'], sub['sgd_restarts'],  '^-', color=ALGO_COLORS['SGD'],   label='SGD',      lw=2)
+    ax.semilogy(sub['N'], sub['amp_restarts'],  's-', color=ALGO_COLORS['AMP'],   label='AMP',      lw=2)
+    ax.semilogy(sub['N'], sub['ampt_restarts'], 'P-', color=ALGO_COLORS['AMP-T'], label='AMP-T',    lw=2)
+    ax.semilogy(sub['N'], sub['iamp_restarts'], 'X-', color=ALGO_COLORS['IAMP'],  label='IAMP',     lw=2)
+    ax.semilogy(sub['N'], sub['spec_restarts'], 'D-', color=ALGO_COLORS['SPEC'],  label='Spectral', lw=2)
     ax.set_title(f'{iter_val} iterations', fontsize=11)
     ax.set_xlabel('N')
     ax.set_ylabel('Restarts within budget')
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(alpha=0.3, which='both')
 plt.tight_layout()
 plt.savefig('fig_exp2_restarts_vs_N.png', dpi=150, bbox_inches='tight')
@@ -808,14 +1173,16 @@ fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
 fig.suptitle(f'Exp 1 vs Exp 2: Gap at N={compare_N} (lower = better)',
              fontsize=13, fontweight='bold')
 x = np.arange(len(ITERATION_VALUES))
-width = 0.20
+width = 0.13
 for ax, sub, title in [(ax1, sub1, 'Exp 1: Single run per seed'),
                         (ax2, sub2, f'Exp 2: Best within {TIME_BUDGET_SEC}s')]:
     for offset, algo, col, key in [
-        (-1.5*width, 'GD',       'gd_gap_pct',   'GD'),
-        (-0.5*width, 'SGD',      'sgd_gap_pct',  'SGD'),
-        ( 0.5*width, 'AMP',      'amp_gap_pct',  'AMP'),
-        ( 1.5*width, 'Spectral', 'spec_gap_pct', 'SPEC'),
+        (-2.5*width, 'GD',       'gd_gap_pct',   'GD'),
+        (-1.5*width, 'SGD',      'sgd_gap_pct',  'SGD'),
+        (-0.5*width, 'AMP',      'amp_gap_pct',  'AMP'),
+        ( 0.5*width, 'AMP-T',    'ampt_gap_pct', 'AMP-T'),
+        ( 1.5*width, 'IAMP',     'iamp_gap_pct', 'IAMP'),
+        ( 2.5*width, 'Spectral', 'spec_gap_pct', 'SPEC'),
     ]:
         vals = [float(sub[sub['iterations']==i][col].values[0]) for i in ITERATION_VALUES]
         ax.bar(x + offset, vals, width, label=algo, color=ALGO_COLORS[key], alpha=0.85)
@@ -824,7 +1191,7 @@ for ax, sub, title in [(ax1, sub1, 'Exp 1: Single run per seed'),
     ax.set_xlabel('Iterations')
     ax.set_ylabel('Relative gap to Parisi (%)')
     ax.set_title(title, fontsize=11)
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(axis='y', alpha=0.3)
 plt.tight_layout()
 plt.savefig('fig_exp1_vs_exp2_bar.png', dpi=150, bbox_inches='tight')
@@ -838,14 +1205,16 @@ fig.suptitle('Experiment 1: Variance of Single-Run Energy/N Across Seeds (std)',
              fontsize=13, fontweight='bold')
 for ax, iter_val in zip(axes, ITERATION_VALUES):
     sub = df1[df1['iterations'] == iter_val]
-    ax.plot(sub['N'], sub['gd_std_eN'],   'o-', color=ALGO_COLORS['GD'],   label='GD',       lw=2)
-    ax.plot(sub['N'], sub['sgd_std_eN'],  '^-', color=ALGO_COLORS['SGD'],  label='SGD',      lw=2)
-    ax.plot(sub['N'], sub['amp_std_eN'],  's-', color=ALGO_COLORS['AMP'],  label='AMP',      lw=2)
-    ax.plot(sub['N'], sub['spec_std_eN'], 'D-', color=ALGO_COLORS['SPEC'], label='Spectral', lw=2)
+    ax.plot(sub['N'], sub['gd_std_eN'],   'o-', color=ALGO_COLORS['GD'],    label='GD',       lw=2)
+    ax.plot(sub['N'], sub['sgd_std_eN'],  '^-', color=ALGO_COLORS['SGD'],   label='SGD',      lw=2)
+    ax.plot(sub['N'], sub['amp_std_eN'],  's-', color=ALGO_COLORS['AMP'],   label='AMP',      lw=2)
+    ax.plot(sub['N'], sub['ampt_std_eN'], 'P-', color=ALGO_COLORS['AMP-T'], label='AMP-T',    lw=2)
+    ax.plot(sub['N'], sub['iamp_std_eN'], 'X-', color=ALGO_COLORS['IAMP'],  label='IAMP',     lw=2)
+    ax.plot(sub['N'], sub['spec_std_eN'], 'D-', color=ALGO_COLORS['SPEC'],  label='Spectral', lw=2)
     ax.set_title(f'{iter_val} iterations', fontsize=11)
     ax.set_xlabel('N')
     ax.set_ylabel('Std of energy/N across seeds')
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
 plt.tight_layout()
 plt.savefig('fig_exp1_variance_vs_N.png', dpi=150, bbox_inches='tight')
@@ -853,27 +1222,29 @@ plt.show()
 print('Saved fig_exp1_variance_vs_N.png')
 
 
-# ── Figure 6: Exp 3 — Gap vs restarts, one line per N ────────────────────────
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-fig.suptitle(f'Experiment 3: AMP vs Spectral — Gap to Parisi vs Restart Budget\n'
-             f'(AMP: {EXP3_AMP_ITERS} iters/restart, averaged over {EXP3_NUM_SEEDS} seeds)',
+# ── Figure 6: Exp 3 — Gap vs restarts, one panel per AMP variant ─────────────
+fig, axes = plt.subplots(1, 4, figsize=(20, 5.5), sharey=True)
+fig.suptitle(f'Experiment 3: AMP variants vs Spectral — Gap to Parisi vs Restart Budget\n'
+             f'(AMP/AMP-T/IAMP: {EXP3_AMP_ITERS} iters/restart, averaged over {EXP3_NUM_SEEDS} seeds)',
              fontsize=12, fontweight='bold')
 
-for N in EXP3_N_VALUES:
-    sub = df3[df3['N'] == N].sort_values('num_restarts')
-    ax1.plot(sub['num_restarts'], sub['amp_gap_pct'],
-             marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}', linestyle='-')
-    ax2.plot(sub['num_restarts'], sub['spec_gap_pct'],
-             marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}', linestyle='--')
-
-ax1.set_title('AMP', fontsize=12)
-ax2.set_title('Spectral', fontsize=12)
-for ax in (ax1, ax2):
+panel_specs = [
+    (axes[0], 'amp_gap_pct',  'AMP',      'AMP'),
+    (axes[1], 'ampt_gap_pct', 'AMP-T',    'AMP-T'),
+    (axes[2], 'iamp_gap_pct', 'IAMP',     'IAMP'),
+    (axes[3], 'spec_gap_pct', 'Spectral', 'SPEC'),
+]
+for ax, col, title, key in panel_specs:
+    for N in EXP3_N_VALUES:
+        sub = df3[df3['N'] == N].sort_values('num_restarts')
+        ax.plot(sub['num_restarts'], sub[col],
+                marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}')
     ax.axhline(0, color='k', lw=0.8, alpha=0.3)
+    ax.set_title(title, fontsize=12, color=ALGO_COLORS[key])
     ax.set_xlabel('Number of restarts')
     ax.set_ylabel('Relative gap to Parisi (%)')
     ax.set_xscale('log')
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(alpha=0.3, which='both')
 plt.tight_layout()
 plt.savefig('fig_exp3_gap_vs_restarts.png', dpi=150, bbox_inches='tight')
@@ -881,22 +1252,27 @@ plt.show()
 print('Saved fig_exp3_gap_vs_restarts.png')
 
 
-# ── Figure 7: Exp 3 — AMP advantage (pp) vs restarts ─────────────────────────
-fig, ax = plt.subplots(figsize=(9, 5))
-fig.suptitle('Experiment 3: AMP Quality Advantage over Spectral vs Restart Budget\n'
-             '(positive = AMP achieves smaller gap; negative = Spectral wins)',
+# ── Figure 7: Exp 3 — AMP/IAMP advantage (pp) vs restarts ────────────────────
+fig, (ax_amp, ax_iamp) = plt.subplots(1, 2, figsize=(15, 5.5), sharey=True)
+fig.suptitle('Experiment 3: AMP and IAMP Quality Advantage over Spectral\n'
+             '(positive = variant achieves smaller gap; negative = Spectral wins)',
              fontsize=11, fontweight='bold')
-ax.axhline(0, color='k', lw=1.2, ls='--', alpha=0.5, label='Spectral = AMP')
-for N in EXP3_N_VALUES:
-    sub = df3[df3['N'] == N].sort_values('num_restarts')
-    advantage = -sub['quality_gap_pp'].values   # positive = AMP closer to Parisi
-    ax.plot(sub['num_restarts'], advantage,
-            marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}')
-ax.set_xlabel('Number of restarts')
-ax.set_ylabel('AMP advantage (percentage points of gap)')
-ax.set_xscale('log')
-ax.legend(fontsize=10)
-ax.grid(alpha=0.3, which='both')
+for ax, col, title, key in [
+    (ax_amp,  'quality_gap_pp',      'AMP advantage',  'AMP'),
+    (ax_iamp, 'iamp_quality_gap_pp', 'IAMP advantage', 'IAMP'),
+]:
+    ax.axhline(0, color='k', lw=1.2, ls='--', alpha=0.5, label='same as Spectral')
+    for N in EXP3_N_VALUES:
+        sub = df3[df3['N'] == N].sort_values('num_restarts')
+        advantage = -sub[col].values   # positive = closer to Parisi than Spectral
+        ax.plot(sub['num_restarts'], advantage,
+                marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}')
+    ax.set_title(title, fontsize=11, color=ALGO_COLORS[key])
+    ax.set_xlabel('Number of restarts')
+    ax.set_ylabel('Advantage (percentage points of gap)')
+    ax.set_xscale('log')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3, which='both')
 plt.tight_layout()
 plt.savefig('fig_exp3_amp_advantage.png', dpi=150, bbox_inches='tight')
 plt.show()
@@ -904,32 +1280,27 @@ print('Saved fig_exp3_amp_advantage.png')
 
 
 # ── Figure 8: Exp 3 — Quality vs FLOPs Pareto (the money plot) ───────────────
-fig, axes = plt.subplots(1, len(EXP3_N_VALUES), figsize=(18, 5), sharey=True)
-fig.suptitle('Experiment 3: Quality vs Total FLOPs — AMP vs Spectral Pareto Frontier\n'
+fig, axes = plt.subplots(1, len(EXP3_N_VALUES), figsize=(20, 5.5), sharey=True)
+fig.suptitle('Experiment 3: Quality vs Total FLOPs — Pareto Frontier\n'
              '(lower-left = better; each point = one restart count)',
              fontsize=12, fontweight='bold')
 
+variant_specs = [
+    ('amp_flops',  'amp_gap_pct',  'AMP',      'AMP',   's'),
+    ('ampt_flops', 'ampt_gap_pct', 'AMP-T',    'AMP-T', 'P'),
+    ('iamp_flops', 'iamp_gap_pct', 'IAMP',     'IAMP',  'X'),
+    ('spec_flops', 'spec_gap_pct', 'Spectral', 'SPEC',  'D'),
+]
 for ax, N in zip(axes, EXP3_N_VALUES):
     sub = df3[df3['N'] == N].sort_values('num_restarts')
-    ax.plot(sub['amp_flops'],  sub['amp_gap_pct'],  's-',
-            color=ALGO_COLORS['AMP'],  lw=2, label='AMP',      markersize=8)
-    ax.plot(sub['spec_flops'], sub['spec_gap_pct'], 'D-',
-            color=ALGO_COLORS['SPEC'], lw=2, label='Spectral',  markersize=8)
-    # Annotate each point with its restart count
-    for _, row in sub.iterrows():
-        ax.annotate(f'r={int(row.num_restarts)}',
-                    (row.amp_flops,  row.amp_gap_pct),
-                    fontsize=7, color=ALGO_COLORS['AMP'],
-                    xytext=(4, 3), textcoords='offset points')
-        ax.annotate(f'r={int(row.num_restarts)}',
-                    (row.spec_flops, row.spec_gap_pct),
-                    fontsize=7, color=ALGO_COLORS['SPEC'],
-                    xytext=(4, -8), textcoords='offset points')
+    for flop_col, gap_col, label, key, marker in variant_specs:
+        ax.plot(sub[flop_col], sub[gap_col], marker=marker, linestyle='-',
+                color=ALGO_COLORS[key], lw=2, label=label, markersize=8)
     ax.set_xscale('log')
     ax.set_title(f'N={N}', fontsize=11)
     ax.set_xlabel('Total FLOPs')
     ax.set_ylabel('Relative gap to Parisi (%)')
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(alpha=0.3, which='both')
 plt.tight_layout()
 plt.savefig('fig_exp3_pareto.png', dpi=150, bbox_inches='tight')
@@ -938,23 +1309,26 @@ print('Saved fig_exp3_pareto.png')
 
 
 # ── Figure 9: Exp 3 — Wall time vs restarts ──────────────────────────────────
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+fig, axes = plt.subplots(1, 4, figsize=(20, 5), sharey=True)
 fig.suptitle('Experiment 3: Wall-Clock Time vs Restart Budget',
              fontsize=12, fontweight='bold')
-for N in EXP3_N_VALUES:
-    sub = df3[df3['N'] == N].sort_values('num_restarts')
-    ax1.plot(sub['num_restarts'], sub['amp_wall_sec'],
-             marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}')
-    ax2.plot(sub['num_restarts'], sub['spec_wall_sec'],
-             marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}')
-ax1.set_title('AMP wall time', fontsize=11)
-ax2.set_title('Spectral wall time', fontsize=11)
-for ax in (ax1, ax2):
+panel_specs = [
+    (axes[0], 'amp_wall_sec',  'AMP',      'AMP'),
+    (axes[1], 'ampt_wall_sec', 'AMP-T',    'AMP-T'),
+    (axes[2], 'iamp_wall_sec', 'IAMP',     'IAMP'),
+    (axes[3], 'spec_wall_sec', 'Spectral', 'SPEC'),
+]
+for ax, col, title, key in panel_specs:
+    for N in EXP3_N_VALUES:
+        sub = df3[df3['N'] == N].sort_values('num_restarts')
+        ax.plot(sub['num_restarts'], sub[col],
+                marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}')
+    ax.set_title(f'{title} wall time', fontsize=11, color=ALGO_COLORS[key])
     ax.set_xlabel('Number of restarts')
     ax.set_ylabel('Wall time (s)')
     ax.set_xscale('log')
     ax.set_yscale('log')
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     ax.grid(alpha=0.3, which='both')
 plt.tight_layout()
 plt.savefig('fig_exp3_wall_time.png', dpi=150, bbox_inches='tight')
@@ -962,22 +1336,29 @@ plt.show()
 print('Saved fig_exp3_wall_time.png')
 
 
-# ── Figure 10: Exp 3 — FLOP ratio AMP/Spectral vs restarts ──────────────────
-fig, ax = plt.subplots(figsize=(9, 5))
-fig.suptitle('Experiment 3: FLOP Ratio (AMP / Spectral) vs Restart Budget\n'
-             '(how many times more FLOPs AMP spends to match Spectral restart count)',
+# ── Figure 10: Exp 3 — FLOP ratios vs Spectral ──────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+fig.suptitle('Experiment 3: FLOP Ratios vs Spectral at each Restart Budget\n'
+             '(how many times more FLOPs each variant spends to match Spectral restart count)',
              fontsize=11, fontweight='bold')
-for N in EXP3_N_VALUES:
-    sub = df3[df3['N'] == N].sort_values('num_restarts')
-    ax.plot(sub['num_restarts'], sub['flop_ratio'],
-            marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}')
-ax.axhline(1, color='k', lw=1, ls='--', alpha=0.4)
-ax.set_xlabel('Number of restarts')
-ax.set_ylabel('FLOP ratio (AMP / Spectral)')
-ax.set_xscale('log')
-ax.set_yscale('log')
-ax.legend(fontsize=10)
-ax.grid(alpha=0.3, which='both')
+ratio_specs = [
+    (axes[0], 'flop_ratio',      'AMP / Spectral',   'AMP'),
+    (axes[1], 'ampt_flop_ratio', 'AMP-T / Spectral', 'AMP-T'),
+    (axes[2], 'iamp_flop_ratio', 'IAMP / Spectral',  'IAMP'),
+]
+for ax, col, title, key in ratio_specs:
+    for N in EXP3_N_VALUES:
+        sub = df3[df3['N'] == N].sort_values('num_restarts')
+        ax.plot(sub['num_restarts'], sub[col],
+                marker=N_MARKERS[N], lw=2, color=N_COLORS[N], label=f'N={N}')
+    ax.axhline(1, color='k', lw=1, ls='--', alpha=0.4)
+    ax.set_title(title, fontsize=11, color=ALGO_COLORS[key])
+    ax.set_xlabel('Number of restarts')
+    ax.set_ylabel('FLOP ratio')
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3, which='both')
 plt.tight_layout()
 plt.savefig('fig_exp3_flop_ratio.png', dpi=150, bbox_inches='tight')
 plt.show()
