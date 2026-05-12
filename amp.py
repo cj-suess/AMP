@@ -2,7 +2,7 @@
 # coding: utf-8
 
 # # SK Model: Fair Comparative Benchmark
-# Three experiments benchmarking GD, SGD, AMP, and Spectral on the SK model.
+# Three experiments benchmarking GD, AMP, and Spectral on the SK model.
 #
 # Experiment 1 — Single-run quality averaged over seeds.
 #   Each algorithm runs exactly once per GOE instance. Results are averaged
@@ -14,8 +14,8 @@
 #   It runs as many restarts as it can fit in that budget and reports the
 #   best result found. This measures practical value per unit of real time.
 #
-# Experiment 3 — AMP vs Spectral: restart sweep (optimality-seeking).
-#   GD and SGD are dropped. AMP and Spectral are each given a fixed restart
+# Experiment 3 — AMP variants vs Spectral: restart sweep (optimality-seeking).
+#   GD is dropped. AMP variants and Spectral are each given a fixed restart
 #   budget [1, 10, 25, 50, 100] on a focused set of N values [500, 1000, 2000, 5000].
 #   AMP uses 500 iterations per restart (good convergence without being wasteful).
 #   This answers: how much does AMP's quality advantage grow as you spend more,
@@ -27,6 +27,7 @@ import pandas as pd
 import time
 import warnings
 from scipy.sparse.linalg import eigsh
+import os
 
 warnings.filterwarnings('ignore')
 
@@ -77,32 +78,7 @@ def gradient_descent_sk(J, num_iterations, learning_rate, convergence_tol, rng):
                 converged = True
     return sigma, energy_history, convergence_iter
 
-# ── SGD ──────────────────────────────────────────────────────────────────────
 
-def stochastic_gradient_descent_sk(J, num_iterations, learning_rate,
-                                   batch_size, eval_every, convergence_tol, rng):
-    N = J.shape[0]
-    batch_size = min(batch_size, N)
-    sigma = rng.uniform(-1.0, 1.0, size=N)
-    energy_history, eval_steps = [], []
-    convergence_iter = num_iterations
-    converged = False
-    for i in range(num_iterations):
-        cols = rng.choice(N, size=batch_size, replace=False)
-        grad_estimate = -(N / batch_size) * (J[:, cols] @ sigma[cols])
-        sigma = sigma - learning_rate * grad_estimate
-        sigma = np.clip(sigma, -1.0, 1.0)
-        should_eval = ((i + 1) % eval_every == 0) or (i == num_iterations - 1)
-        if should_eval:
-            e = calculate_energy(sigma, J)
-            energy_history.append(float(e))
-            eval_steps.append(i + 1)
-            if len(energy_history) > 1 and not converged:
-                delta = abs(energy_history[-1] - energy_history[-2])
-                if delta < convergence_tol * abs(energy_history[-1] + 1e-12):
-                    convergence_iter = i + 1
-                    converged = True
-    return sigma, energy_history, eval_steps, convergence_iter
 
 # ── AMP ──────────────────────────────────────────────────────────────────────
 
@@ -226,12 +202,47 @@ def iamp_sk(J, m_init, num_iterations, damping, pde_xmax=6.0, pde_nx=401,
 
     return np.sign(m)
 
-
-def precompute_iamp_pde(num_iterations, pde_xmax=6.0, pde_nx=401):
-    """Solve the Parisi PDE once; reusable across restarts at the same iters."""
+def optimize_parisi_measure_sk(num_iterations, pde_xmax=6.0, pde_nx=401, opt_steps=30, lr=0.5):
+    """Numerically minimizes the zero-temperature Parisi functional via finite differences."""
     t_grid = np.linspace(0.0, 1.0, num_iterations)
     x_grid = np.linspace(-pde_xmax, pde_xmax, pde_nx)
-    mu_t = np.clip(np.linspace(0.0, 1.0, num_iterations), 0.0, 1.0)
+    mu_t = np.linspace(0.0, 1.0, num_iterations)
+    
+    def eval_parisi(mu_array):
+        mu_valid = np.maximum.accumulate(np.clip(mu_array, 0.0, 1.0))
+        Phi, _ = solve_parisi_pde_sk(mu_valid, x_grid, t_grid)
+        phi_0_0 = np.interp(0.0, x_grid, Phi[0])
+        # The Parisi functional P(mu) at T=0
+        integral = 0.5 * np.trapz(t_grid * mu_valid, t_grid)
+        return phi_0_0 - integral
+
+    eps = 1e-4
+    for _ in range(opt_steps):
+        grad = np.zeros(num_iterations)
+        base_val = eval_parisi(mu_t)
+        for i in range(1, num_iterations):
+            mu_eps = np.copy(mu_t)
+            mu_eps[i] += eps
+            grad[i] = (eval_parisi(mu_eps) - base_val) / eps
+            
+        mu_t -= lr * grad
+        # Project back to valid state: monotonic, bounded [0, 1]
+        mu_t = np.maximum.accumulate(np.clip(mu_t, 0.0, 1.0))
+        
+    return mu_t
+
+
+def precompute_iamp_pde(num_iterations, pde_xmax=6.0, pde_nx=401):
+    t_grid = np.linspace(0.0, 1.0, num_iterations)
+    x_grid = np.linspace(-pde_xmax, pde_xmax, pde_nx)
+    cache_filename = f"parisi_mu_t_{num_iterations}_{pde_nx}.npy"
+    if os.path.exists(cache_filename):
+        print(f"Loading cached Parisi measure from {cache_filename}...")
+        mu_t = np.load(cache_filename)
+    else:
+        print("Optimizing Parisi measure (this may take a minute)...")
+        mu_t = optimize_parisi_measure_sk(num_iterations, pde_xmax, pde_nx)
+        np.save(cache_filename, mu_t)
     _, dPhi_dx = solve_parisi_pde_sk(mu_t, x_grid, t_grid)
     return x_grid, dPhi_dx
 
@@ -304,9 +315,7 @@ print('Algorithm definitions ready.')
 def flops_gd(N, iters):
     return iters * 2 * (2 * N * N)
 
-def flops_sgd(N, iters, batch_size, num_energy_evals):
-    return (iters * (2 * N * batch_size + 3 * N)
-            + num_energy_evals * 2 * N * N)
+
 
 def flops_amp_single(N, amp_iters, quench_passes):
     return amp_iters * (2 * N * N) + quench_passes * (2 * N * N)
@@ -335,9 +344,9 @@ print('FLOP estimators defined.')
 # =============================================================================
 
 # Experiments 1 & 2
-N_VALUES         = [50, 100, 250, 500] # , 1000, 2000, 3000, 5000
-ITERATION_VALUES = [100, 250] # , 500, 1000
-NUM_SEEDS        = 3
+N_VALUES         = [100, 250, 500, 1000, 5000]
+ITERATION_VALUES = [100, 250, 500, 1000]
+NUM_SEEDS        = 10
 TIME_BUDGET_SEC  = 2.0
 
 # Experiment 3
@@ -350,9 +359,6 @@ PARISI_VALUE       = -0.7633
 # Shared hyperparameters
 GD_LR           = 0.1
 GD_CONV_TOL     = 1e-5
-SGD_LR          = 0.05
-SGD_BATCH_SIZE  = 64
-SGD_EVAL_EVERY  = 10
 AMP_DAMPING     = 0.7
 AMP_INIT_SCALE  = 1e-3
 IAMP_PDE_XMAX   = 6.0
@@ -361,7 +367,6 @@ SPECTRAL_REFINE = True
 
 ALGO_COLORS  = {
     'GD':    '#E91E63',
-    'SGD':   '#7E57C2',
     'AMP':   '#00BCD4',
     'AMP-T': '#26A69A',
     'IAMP':  '#5C6BC0',
@@ -401,12 +406,12 @@ for ITER in ITERATION_VALUES:
         cell_idx += 1
         theoretical_limit = PARISI_VALUE * N
 
-        gd_energies, sgd_energies, amp_energies, ampt_energies, iamp_energies, spec_energies = (
-            [], [], [], [], [], [])
-        gd_walls, sgd_walls, amp_walls, ampt_walls, iamp_walls, spec_walls = (
-            [], [], [], [], [], [])
-        gd_flops_list, sgd_flops_list, amp_flops_list, ampt_flops_list, iamp_flops_list, spec_flops_list = (
-            [], [], [], [], [], [])
+        gd_energies, amp_energies, ampt_energies, iamp_energies, spec_energies = (
+            [], [], [], [], [])
+        gd_walls, amp_walls, ampt_walls, iamp_walls, spec_walls = (
+            [], [], [], [], [])
+        gd_flops_list, amp_flops_list, ampt_flops_list, iamp_flops_list, spec_flops_list = (
+            [], [], [], [], [])
         gd_conv_iters = []
 
         # IAMP PDE solve is shared across all seeds at this (N, ITER) cell.
@@ -424,13 +429,6 @@ for ITER in ITERATION_VALUES:
             gd_energies.append(gd_curve[-1])
             gd_flops_list.append(flops_gd(N, ITER))
             gd_conv_iters.append(gd_conv_iter)
-
-            t0 = time.perf_counter()
-            _, sgd_curve, _, sgd_conv_iter = stochastic_gradient_descent_sk(
-                J, ITER, SGD_LR, SGD_BATCH_SIZE, SGD_EVAL_EVERY, GD_CONV_TOL, rng)
-            sgd_walls.append(time.perf_counter() - t0)
-            sgd_energies.append(sgd_curve[-1])
-            sgd_flops_list.append(flops_sgd(N, ITER, min(SGD_BATCH_SIZE, N), len(sgd_curve)))
 
             m_init = get_orthogonal_starts(1, N, rng, scale=AMP_INIT_SCALE)[0]
             t0 = time.perf_counter()
@@ -471,7 +469,6 @@ for ITER in ITERATION_VALUES:
             return np.mean(vals), np.std(vals)
 
         gd_e_mean,   gd_e_std   = stats(gd_energies)
-        sgd_e_mean,  sgd_e_std  = stats(sgd_energies)
         amp_e_mean,  amp_e_std  = stats(amp_energies)
         ampt_e_mean, ampt_e_std = stats(ampt_energies)
         iamp_e_mean, iamp_e_std = stats(iamp_energies)
@@ -481,7 +478,6 @@ for ITER in ITERATION_VALUES:
 
         print(f'[{cell_idx:02d}/{total_cells}]  N={N:>5d}  iter={ITER:<5d}  '
               f'GD: {gd_e_mean/N:+.4f}  '
-              f'SGD: {sgd_e_mean/N:+.4f}  '
               f'AMP: {amp_e_mean/N:+.4f}  '
               f'AMP-T: {ampt_e_mean/N:+.4f}  '
               f'IAMP: {iamp_e_mean/N:+.4f}  '
@@ -495,37 +491,32 @@ for ITER in ITERATION_VALUES:
             theoretical_limit = round(theoretical_limit, 4),
             parisi_value      = PARISI_VALUE,
             gd_mean_eN        = round(gd_e_mean / N, 5),
-            sgd_mean_eN       = round(sgd_e_mean / N, 5),
             amp_mean_eN       = round(amp_e_mean / N, 5),
             ampt_mean_eN      = round(ampt_e_mean / N, 5),
             iamp_mean_eN      = round(iamp_e_mean / N, 5),
             spec_mean_eN      = round(spec_e_mean / N, 5),
             gd_std_eN         = round(gd_e_std / N, 5),
-            sgd_std_eN        = round(sgd_e_std / N, 5),
             amp_std_eN        = round(amp_e_std / N, 5),
             ampt_std_eN       = round(ampt_e_std / N, 5),
             iamp_std_eN       = round(iamp_e_std / N, 5),
             spec_std_eN       = round(spec_e_std / N, 5),
             gd_gap_pct        = round(gap_pct(gd_e_mean), 3),
-            sgd_gap_pct       = round(gap_pct(sgd_e_mean), 3),
             amp_gap_pct       = round(gap_pct(amp_e_mean), 3),
             ampt_gap_pct      = round(gap_pct(ampt_e_mean), 3),
             iamp_gap_pct      = round(gap_pct(iamp_e_mean), 3),
             spec_gap_pct      = round(gap_pct(spec_e_mean), 3),
             gd_wall_sec       = round(np.mean(gd_walls), 5),
-            sgd_wall_sec      = round(np.mean(sgd_walls), 5),
             amp_wall_sec      = round(np.mean(amp_walls), 5),
             ampt_wall_sec     = round(np.mean(ampt_walls), 5),
             iamp_wall_sec     = round(np.mean(iamp_walls), 5),
             spec_wall_sec     = round(np.mean(spec_walls), 5),
             gd_flops          = int(np.mean(gd_flops_list)),
-            sgd_flops         = int(np.mean(sgd_flops_list)),
             amp_flops         = int(np.mean(amp_flops_list)),
             ampt_flops        = int(np.mean(ampt_flops_list)),
             iamp_flops        = int(np.mean(iamp_flops_list)),
             spec_flops        = int(np.mean(spec_flops_list)),
             winner            = min(
-                [('GD', gd_e_mean), ('SGD', sgd_e_mean),
+                [('GD', gd_e_mean),
                  ('AMP', amp_e_mean), ('AMP-T', ampt_e_mean),
                  ('IAMP', iamp_e_mean), ('SPEC', spec_e_mean)],
                 key=lambda x: x[1])[0],
@@ -566,17 +557,6 @@ for ITER in ITERATION_VALUES:
             gd_total_flops += flops_gd(N, ITER)
             gd_restarts += 1
         gd_wall = time.perf_counter() - t_gd_start
-
-        sgd_best = np.inf; sgd_restarts = 0; sgd_total_flops = 0
-        t_sgd_start = time.perf_counter()
-        while time.perf_counter() - t_sgd_start < TIME_BUDGET_SEC:
-            _, sgd_curve, _, _ = stochastic_gradient_descent_sk(
-                J, ITER, SGD_LR, SGD_BATCH_SIZE, SGD_EVAL_EVERY, GD_CONV_TOL, rng)
-            e = sgd_curve[-1]
-            if e < sgd_best: sgd_best = e
-            sgd_total_flops += flops_sgd(N, ITER, min(SGD_BATCH_SIZE, N), len(sgd_curve))
-            sgd_restarts += 1
-        sgd_wall = time.perf_counter() - t_sgd_start
 
         amp_best = np.inf; amp_restarts = 0; amp_total_flops = 0
         amp_batch_size = min(N, 64)
@@ -666,7 +646,6 @@ for ITER in ITERATION_VALUES:
 
         print(f'[{cell_idx:02d}/{total_cells}]  N={N:>5d}  iter={ITER:<5d}  '
               f'GD: {gd_best/N:+.4f} (x{gd_restarts})  '
-              f'SGD: {sgd_best/N:+.4f} (x{sgd_restarts})  '
               f'AMP: {amp_best/N:+.4f} (x{amp_restarts})  '
               f'AMP-T: {ampt_best/N:+.4f} (x{ampt_restarts})  '
               f'IAMP: {iamp_best/N:+.4f} (x{iamp_restarts})  '
@@ -680,37 +659,32 @@ for ITER in ITERATION_VALUES:
             theoretical_limit = round(theoretical_limit, 4),
             parisi_value      = PARISI_VALUE,
             gd_best_eN        = round(gd_best / N, 5),
-            sgd_best_eN       = round(sgd_best / N, 5),
             amp_best_eN       = round(amp_best / N, 5),
             ampt_best_eN      = round(ampt_best / N, 5),
             iamp_best_eN      = round(iamp_best / N, 5),
             spec_best_eN      = round(spec_best / N, 5),
             gd_gap_pct        = round(gap_pct(gd_best), 3),
-            sgd_gap_pct       = round(gap_pct(sgd_best), 3),
             amp_gap_pct       = round(gap_pct(amp_best), 3),
             ampt_gap_pct      = round(gap_pct(ampt_best), 3),
             iamp_gap_pct      = round(gap_pct(iamp_best), 3),
             spec_gap_pct      = round(gap_pct(spec_best), 3),
             gd_restarts       = gd_restarts,
-            sgd_restarts      = sgd_restarts,
             amp_restarts      = amp_restarts,
             ampt_restarts     = ampt_restarts,
             iamp_restarts     = iamp_restarts,
             spec_restarts     = spec_restarts,
             gd_wall_sec       = round(gd_wall, 3),
-            sgd_wall_sec      = round(sgd_wall, 3),
             amp_wall_sec      = round(amp_wall, 3),
             ampt_wall_sec     = round(ampt_wall, 3),
             iamp_wall_sec     = round(iamp_wall, 3),
             spec_wall_sec     = round(spec_wall, 3),
             gd_flops          = gd_total_flops,
-            sgd_flops         = sgd_total_flops,
             amp_flops         = amp_total_flops,
             ampt_flops        = ampt_total_flops,
             iamp_flops        = iamp_total_flops,
             spec_flops        = spec_total_flops,
             winner            = min(
-                [('GD', gd_best), ('SGD', sgd_best),
+                [('GD', gd_best),
                  ('AMP', amp_best), ('AMP-T', ampt_best),
                  ('IAMP', iamp_best), ('SPEC', spec_best)],
                 key=lambda x: x[1])[0],
@@ -723,7 +697,7 @@ print(f'\n✓ Experiment 2 complete. {len(df2)} records.')
 # =============================================================================
 # 6. Experiment 3 — AMP variants vs Spectral: restart sweep (optimality-seeking)
 #
-#   GD and SGD are dropped — we already know they underperform.
+#   GD is dropped for this experiment — we focus on AMP variants vs Spectral.
 #   Both AMP and Spectral are given exactly R restarts from the sweep
 #   EXP3_RESTART_VALUES = [1, 10, 25, 50, 100].
 #   AMP uses EXP3_AMP_ITERS iterations per restart.
@@ -965,9 +939,9 @@ print('EXPERIMENT 1 SUMMARY — Mean Relative Gap to Parisi Value (%)')
 print(f'(single run per instance, averaged over {NUM_SEEDS} seeds)')
 print('='*70)
 gap1 = df1.groupby('iterations')[
-    ['gd_gap_pct', 'sgd_gap_pct', 'amp_gap_pct', 'ampt_gap_pct', 'iamp_gap_pct', 'spec_gap_pct']
+    ['gd_gap_pct', 'amp_gap_pct', 'ampt_gap_pct', 'iamp_gap_pct', 'spec_gap_pct']
 ].mean().round(2)
-gap1.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
+gap1.columns = ['GD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 print(gap1.to_string())
 
 print('\n' + '='*70)
@@ -979,7 +953,6 @@ for iter_val in ITERATION_VALUES:
     for _, row in sub.iterrows():
         print(f"    N={int(row.N):>5d}  "
               f"GD: {row.gd_mean_eN:+.4f}  "
-              f"SGD: {row.sgd_mean_eN:+.4f}  "
               f"AMP: {row.amp_mean_eN:+.4f}  "
               f"AMP-T: {row.ampt_mean_eN:+.4f}  "
               f"IAMP: {row.iamp_mean_eN:+.4f}  "
@@ -990,18 +963,18 @@ print('\n' + '='*70)
 print('EXPERIMENT 1 SUMMARY — Mean wall time (s) per single run')
 print('='*70)
 time1 = df1.groupby('iterations')[
-    ['gd_wall_sec', 'sgd_wall_sec', 'amp_wall_sec', 'ampt_wall_sec', 'iamp_wall_sec', 'spec_wall_sec']
+    ['gd_wall_sec', 'amp_wall_sec', 'ampt_wall_sec', 'iamp_wall_sec', 'spec_wall_sec']
 ].mean().round(4)
-time1.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
+time1.columns = ['GD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 print(time1.to_string())
 
 print('\n' + '='*70)
 print('EXPERIMENT 1 SUMMARY — Mean FLOPs per single run')
 print('='*70)
 flop1 = df1.groupby('iterations')[
-    ['gd_flops', 'sgd_flops', 'amp_flops', 'ampt_flops', 'iamp_flops', 'spec_flops']
+    ['gd_flops', 'amp_flops', 'ampt_flops', 'iamp_flops', 'spec_flops']
 ].mean()
-flop1.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
+flop1.columns = ['GD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 flop1_fmt = flop1.copy()
 for col in flop1_fmt.columns:
     flop1_fmt[col] = flop1_fmt[col].apply(lambda x: f'{x:.2e}')
@@ -1011,18 +984,18 @@ print('\n' + '='*70)
 print(f'EXPERIMENT 2 SUMMARY — Best gap within {TIME_BUDGET_SEC}s budget (%)')
 print('='*70)
 gap2 = df2.groupby('iterations')[
-    ['gd_gap_pct', 'sgd_gap_pct', 'amp_gap_pct', 'ampt_gap_pct', 'iamp_gap_pct', 'spec_gap_pct']
+    ['gd_gap_pct', 'amp_gap_pct', 'ampt_gap_pct', 'iamp_gap_pct', 'spec_gap_pct']
 ].mean().round(2)
-gap2.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
+gap2.columns = ['GD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 print(gap2.to_string())
 
 print('\n' + '='*70)
 print(f'EXPERIMENT 2 SUMMARY — Mean restarts completed within {TIME_BUDGET_SEC}s')
 print('='*70)
 restarts2 = df2.groupby('iterations')[
-    ['gd_restarts', 'sgd_restarts', 'amp_restarts', 'ampt_restarts', 'iamp_restarts', 'spec_restarts']
+    ['gd_restarts', 'amp_restarts', 'ampt_restarts', 'iamp_restarts', 'spec_restarts']
 ].mean().round(1)
-restarts2.columns = ['GD', 'SGD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
+restarts2.columns = ['GD', 'AMP', 'AMP-T', 'IAMP', 'Spectral']
 print(restarts2.to_string())
 
 print('\n' + '='*70)
@@ -1096,7 +1069,6 @@ for ax, iter_val in zip(axes, ITERATION_VALUES):
     sub = df1[df1['iterations'] == iter_val]
     for algo, col_mean, col_std, marker in [
         ('GD',      'gd_gap_pct',   'gd_std_eN',   'o'),
-        ('SGD',     'sgd_gap_pct',  'sgd_std_eN',  '^'),
         ('AMP',     'amp_gap_pct',  'amp_std_eN',  's'),
         ('AMP-T',   'ampt_gap_pct', 'ampt_std_eN', 'P'),
         ('IAMP',    'iamp_gap_pct', 'iamp_std_eN', 'X'),
@@ -1126,7 +1098,6 @@ fig.suptitle(f'Experiment 2: Best Gap within {TIME_BUDGET_SEC}s Budget',
 for ax, iter_val in zip(axes, ITERATION_VALUES):
     sub = df2[df2['iterations'] == iter_val]
     ax.semilogy(sub['N'], sub['gd_gap_pct'],   'o-', color=ALGO_COLORS['GD'],    label='GD',       lw=2)
-    ax.semilogy(sub['N'], sub['sgd_gap_pct'],  '^-', color=ALGO_COLORS['SGD'],   label='SGD',      lw=2)
     ax.semilogy(sub['N'], sub['amp_gap_pct'],  's-', color=ALGO_COLORS['AMP'],   label='AMP',      lw=2)
     ax.semilogy(sub['N'], sub['ampt_gap_pct'], 'P-', color=ALGO_COLORS['AMP-T'], label='AMP-T',    lw=2)
     ax.semilogy(sub['N'], sub['iamp_gap_pct'], 'X-', color=ALGO_COLORS['IAMP'],  label='IAMP',     lw=2)
@@ -1149,7 +1120,6 @@ fig.suptitle(f'Experiment 2: Restarts Completed within {TIME_BUDGET_SEC}s',
 for ax, iter_val in zip(axes, ITERATION_VALUES):
     sub = df2[df2['iterations'] == iter_val]
     ax.semilogy(sub['N'], sub['gd_restarts'],   'o-', color=ALGO_COLORS['GD'],    label='GD',       lw=2)
-    ax.semilogy(sub['N'], sub['sgd_restarts'],  '^-', color=ALGO_COLORS['SGD'],   label='SGD',      lw=2)
     ax.semilogy(sub['N'], sub['amp_restarts'],  's-', color=ALGO_COLORS['AMP'],   label='AMP',      lw=2)
     ax.semilogy(sub['N'], sub['ampt_restarts'], 'P-', color=ALGO_COLORS['AMP-T'], label='AMP-T',    lw=2)
     ax.semilogy(sub['N'], sub['iamp_restarts'], 'X-', color=ALGO_COLORS['IAMP'],  label='IAMP',     lw=2)
@@ -1177,12 +1147,11 @@ width = 0.13
 for ax, sub, title in [(ax1, sub1, 'Exp 1: Single run per seed'),
                         (ax2, sub2, f'Exp 2: Best within {TIME_BUDGET_SEC}s')]:
     for offset, algo, col, key in [
-        (-2.5*width, 'GD',       'gd_gap_pct',   'GD'),
-        (-1.5*width, 'SGD',      'sgd_gap_pct',  'SGD'),
-        (-0.5*width, 'AMP',      'amp_gap_pct',  'AMP'),
-        ( 0.5*width, 'AMP-T',    'ampt_gap_pct', 'AMP-T'),
-        ( 1.5*width, 'IAMP',     'iamp_gap_pct', 'IAMP'),
-        ( 2.5*width, 'Spectral', 'spec_gap_pct', 'SPEC'),
+        (-2.0*width, 'GD',       'gd_gap_pct',   'GD'),
+        (-1.0*width, 'AMP',      'amp_gap_pct',  'AMP'),
+        ( 0.0*width, 'AMP-T',    'ampt_gap_pct', 'AMP-T'),
+        ( 1.0*width, 'IAMP',     'iamp_gap_pct', 'IAMP'),
+        ( 2.0*width, 'Spectral', 'spec_gap_pct', 'SPEC'),
     ]:
         vals = [float(sub[sub['iterations']==i][col].values[0]) for i in ITERATION_VALUES]
         ax.bar(x + offset, vals, width, label=algo, color=ALGO_COLORS[key], alpha=0.85)
@@ -1206,7 +1175,6 @@ fig.suptitle('Experiment 1: Variance of Single-Run Energy/N Across Seeds (std)',
 for ax, iter_val in zip(axes, ITERATION_VALUES):
     sub = df1[df1['iterations'] == iter_val]
     ax.plot(sub['N'], sub['gd_std_eN'],   'o-', color=ALGO_COLORS['GD'],    label='GD',       lw=2)
-    ax.plot(sub['N'], sub['sgd_std_eN'],  '^-', color=ALGO_COLORS['SGD'],   label='SGD',      lw=2)
     ax.plot(sub['N'], sub['amp_std_eN'],  's-', color=ALGO_COLORS['AMP'],   label='AMP',      lw=2)
     ax.plot(sub['N'], sub['ampt_std_eN'], 'P-', color=ALGO_COLORS['AMP-T'], label='AMP-T',    lw=2)
     ax.plot(sub['N'], sub['iamp_std_eN'], 'X-', color=ALGO_COLORS['IAMP'],  label='IAMP',     lw=2)
