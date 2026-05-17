@@ -1,26 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# # SK Model: Fair Comparative Benchmark
-# Three experiments benchmarking GD, AMP, and Spectral on the SK model.
-#
-# Experiment 1 — Single-run quality averaged over seeds
-#   Each algorithm runs exactly once per GOE instance. Results are averaged
-#   over NUM_SEEDS instances. No algorithm gets more attempts than another.
-#   This measures intrinsic per-run quality.
-#
-# Experiment 2 — Fixed wall-clock budget
-#   Each algorithm is given TIME_BUDGET_SEC seconds per (N, iter) cell.
-#   It runs as many restarts as it can fit in that budget and reports the
-#   best result found. This measures practical value per unit of real time.
-#
-# Experiment 3 — AMP variants vs Spectral: restart sweep (optimality-seeking)
-#   GD is dropped. AMP variants and Spectral are each given a fixed restart
-#   budget on a focused set of N values.
-#   AMP uses 500 iterations per restart.
-#   Goal is to see how much does AMP's quality advantage grow as the number of restarts growxs,
-#   and what is the FLOP cost of that advantage relative to Spectral.
-
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -356,7 +333,6 @@ def spectral_sk(J, refine=True):
 
 print('Algorithm definitions ready.')
 
-
 # FLOP Estimators
 
 def flops_gd(N, iters, quench_passes=0):
@@ -380,6 +356,33 @@ def flops_spectral(N, lanczos_matvecs, quench_passes):
 
 print('FLOP estimators defined.')
 
+
+####################################################################################################
+####################################################################################################
+
+# Everything below is experiments and plotting (some plotting was experimental and not used)
+
+####################################################################################################
+####################################################################################################
+
+"""
+Experiment 1 — Single-Run Quality
+    Each algorithm runs exactly once per GOE instance, averaged over
+    NUM_SEEDS instances. No algorithm receives more attempts than another.
+    Measures intrinsic per-run quality.
+
+Experiment 2 — Fixed Wall-Clock Budget
+    Each algorithm is given TIME_BUDGET_SEC seconds per (N, iterations)
+    cell and runs as many restarts as fit within that budget, reporting
+    the best result found. Measures practical value per unit of real time.
+
+Experiment 3 — Restart Sweep (AMP variants vs Spectral)
+    GD is excluded. AMP variants and Spectral are each given a fixed
+    restart budget across a focused set of N values, with AMP using
+    EXP3_AMP_ITERS iterations per restart. Measures how IAMP's quality
+    advantage over Spectral grows with restart budget, and quantifies
+    the FLOP cost of that advantage.
+"""
 
 # Configs
 
